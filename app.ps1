@@ -214,7 +214,18 @@ $script:Excel = $null
 $script:Book = $null
 $script:DataSheet = $null
 $script:PlanSheet = $null
+$script:GerminationLogSheet = $null
+$script:SettingsSheet = $null
 $script:WorkbookPath = ''
+
+# 当前实验参数，从“试验设置”工作表读取
+$script:ExperimentSettings = [ordered]@{
+    TotalSeeds         = 50
+    MeasureSampleCount = 10
+    DefaultReplicate   = 'R1'
+    MeasureDAGs        = @(3, 7, 14)
+    GerminationMode    = '每日新增'
+}
 
 # 样本ID -> 样本基础信息
 $script:DataCache = @{}
@@ -275,6 +286,16 @@ function Disconnect-Workbook {
         $script:PlanSheet = $null
     }
 
+    if ($null -ne $script:GerminationLogSheet) {
+        Release-Com $script:GerminationLogSheet
+        $script:GerminationLogSheet = $null
+    }
+
+    if ($null -ne $script:SettingsSheet) {
+        Release-Com $script:SettingsSheet
+        $script:SettingsSheet = $null
+    }
+
     if ($null -ne $script:Book) {
         Release-Com $script:Book
         $script:Book = $null
@@ -299,6 +320,13 @@ function Disconnect-Workbook {
     $script:CoordCache = @{}
     $script:GerminationSpeciesCache = @()
     $script:SelectedGerminationSpeciesId = ''
+    $script:ExperimentSettings = [ordered]@{
+        TotalSeeds         = 50
+        MeasureSampleCount = 10
+        DefaultReplicate   = 'R1'
+        MeasureDAGs        = @(3, 7, 14)
+        GerminationMode    = '每日新增'
+    }
     $script:WorkbookPath = ''
 
     # 帮助 .NET 释放残余 COM Runtime Callable Wrapper
@@ -384,6 +412,22 @@ function Connect-Workbook([string]$Path) {
         throw '缺少工作表：测定时间计划表'
     }
 
+    try {
+        $script:GerminationLogSheet = $script:Book.Worksheets.Item('发芽记录')
+    }
+    catch {
+        Disconnect-Workbook
+        throw '缺少工作表：发芽记录'
+    }
+
+    try {
+        $script:SettingsSheet = $script:Book.Worksheets.Item('试验设置')
+    }
+    catch {
+        Disconnect-Workbook
+        throw '缺少工作表：试验设置'
+    }
+
     $script:WorkbookPath = (Resolve-Path -LiteralPath $Path).Path
 
     Set-Content `
@@ -406,12 +450,162 @@ function Connect-Workbook([string]$Path) {
 # =============================================================================
 # 05. Excel -> 内存缓存
 # =============================================================================
+function Load-ExperimentSettings {
+    # 从“试验设置”工作表读取实验参数。
+    # A = 参数名
+    # B = 当前值
+    #
+    # 未识别的参数暂时忽略，便于未来扩展设置表。
+
+    $settings = [ordered]@{
+        TotalSeeds         = 50
+        MeasureSampleCount = 10
+        DefaultReplicate   = 'R1'
+        MeasureDAGs        = @(3, 7, 14)
+        GerminationMode    = '每日新增'
+    }
+
+    $lastCell = $null
+
+    try {
+        $lastCell = $script:SettingsSheet.Cells.Item(
+            $script:SettingsSheet.Rows.Count,
+            1
+        ).End(-4162)
+
+        $lastRow = [int]$lastCell.Row
+    }
+    finally {
+        Release-Com $lastCell
+    }
+
+    if ($lastRow -lt 2) {
+        throw '“试验设置”工作表没有有效参数。'
+    }
+
+    $range = $null
+
+    try {
+        $range = $script:SettingsSheet.Range("A2:B$lastRow")
+        $values = $range.Value2
+    }
+    finally {
+        Release-Com $range
+    }
+
+    $lower = $values.GetLowerBound(0)
+    $upper = $values.GetUpperBound(0)
+
+    for ($i = $lower; $i -le $upper; $i++) {
+        $name = Safe-Text ($values.GetValue($i, 1))
+        $value = Safe-Text ($values.GetValue($i, 2))
+
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            continue
+        }
+
+        switch ($name) {
+            '总种子数' {
+                $parsed = 0
+
+                if (
+                    -not [int]::TryParse(
+                        $value,
+                        [ref]$parsed
+                    ) -or
+                    $parsed -le 0
+                ) {
+                    throw '试验设置“总种子数”必须为大于 0 的整数。'
+                }
+
+                $settings.TotalSeeds = $parsed
+            }
+
+            '根苗长取样数' {
+                $parsed = 0
+
+                if (
+                    -not [int]::TryParse(
+                        $value,
+                        [ref]$parsed
+                    ) -or
+                    $parsed -le 0
+                ) {
+                    throw '试验设置“根苗长取样数”必须为大于 0 的整数。'
+                }
+
+                $settings.MeasureSampleCount = $parsed
+            }
+
+            '默认重复' {
+                if ([string]::IsNullOrWhiteSpace($value)) {
+                    throw '试验设置“默认重复”不能为空。'
+                }
+
+                $settings.DefaultReplicate = $value
+            }
+
+            '根苗长测定节点' {
+                $dagValues = New-Object System.Collections.ArrayList
+
+                foreach ($part in ($value -split ',')) {
+                    $text = $part.Trim()
+                    $dag = 0
+
+                    if (
+                        [string]::IsNullOrWhiteSpace($text) -or
+                        -not [int]::TryParse(
+                            $text,
+                            [ref]$dag
+                        ) -or
+                        $dag -le 0
+                    ) {
+                        throw '试验设置“根苗长测定节点”格式无效，应类似：3,7,14'
+                    }
+
+                    [void]$dagValues.Add($dag)
+                }
+
+                if ($dagValues.Count -eq 0) {
+                    throw '试验设置“根苗长测定节点”不能为空。'
+                }
+
+                $settings.MeasureDAGs = @($dagValues)
+            }
+
+            '发芽记录模式' {
+                if ([string]::IsNullOrWhiteSpace($value)) {
+                    throw '试验设置“发芽记录模式”不能为空。'
+                }
+
+                $settings.GerminationMode = $value
+            }
+        }
+    }
+
+    if ($settings.MeasureSampleCount -gt $settings.TotalSeeds) {
+        throw '“根苗长取样数”不能大于“总种子数”。'
+    }
+
+    $script:ExperimentSettings = $settings
+
+    Perf-Log (
+        "实验设置：" +
+        "总种子数=$($settings.TotalSeeds)，" +
+        "取样数=$($settings.MeasureSampleCount)，" +
+        "重复=$($settings.DefaultReplicate)，" +
+        "DAG=$($settings.MeasureDAGs -join ',')，" +
+        "发芽记录模式=$($settings.GerminationMode)"
+    )
+}
 
 function Rebuild-Cache {
     # 性能关键点：
     # Excel 只在这里批量读取一次，之后所有查询/筛选都在内存完成。
 
     Perf-Log 'Rebuild-Cache 开始'
+    
+    Load-ExperimentSettings
 
     $script:DataCache = @{}
     $script:PlanCache = @{}
@@ -1735,7 +1929,7 @@ function Set-UiGrid($Grid) {
     $Grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = $script:UiPalette.GridHeader
     $Grid.ColumnHeadersDefaultCellStyle.SelectionForeColor = $script:UiPalette.TextPrimary
     $Grid.ColumnHeadersDefaultCellStyle.Alignment =
-        [Windows.Forms.DataGridViewContentAlignment]::MiddleCenter
+    [Windows.Forms.DataGridViewContentAlignment]::MiddleCenter
 
     $Grid.DefaultCellStyle.BackColor = $script:UiPalette.Surface
     $Grid.DefaultCellStyle.ForeColor = $script:UiPalette.TextPrimary
