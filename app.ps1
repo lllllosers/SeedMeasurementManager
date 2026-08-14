@@ -140,6 +140,41 @@ function ExcelDate-ToText($Value) {
     return [string]$Value
 }
 
+function ExcelDate-ToDateTime($Value) {
+    if ($null -eq $Value -or $Value -eq '') {
+        return $null
+    }
+
+    try {
+        if (
+            $Value -is [double] -or
+            $Value -is [float] -or
+            $Value -is [decimal] -or
+            $Value -is [int] -or
+            $Value -is [long]
+        ) {
+            return [DateTime]::FromOADate([double]$Value)
+        }
+
+        if ($Value -is [DateTime]) {
+            return [DateTime]$Value
+        }
+
+        $parsed = [DateTime]::MinValue
+
+        if (
+            [DateTime]::TryParse(
+                ([string]$Value).Trim(),
+                [ref]$parsed
+            )
+        ) {
+            return $parsed
+        }
+    }
+    catch {}
+
+    return $null
+}
 
 function Test-GerminatedValue($Value) {
     # 发芽时间非空即视为“已发芽”。
@@ -236,6 +271,13 @@ $script:PlanCache = @{}
 # 今日需要执行的任务
 $script:TodayTaskCache = @()
 
+# “发芽记录”中的全部历史巡检记录
+$script:GerminationLogCache = @()
+
+# 培养皿当前发芽状态
+# Key = 物种编号|重复，例如 001|R1
+$script:GerminationStatusCache = @{}
+
 # 物种编号 -> 发芽巡检坐标（如 E5）
 $script:CoordCache = @{}
 
@@ -317,6 +359,8 @@ function Disconnect-Workbook {
     $script:DataCache = @{}
     $script:PlanCache = @{}
     $script:TodayTaskCache = @()
+    $script:GerminationLogCache = @()
+    $script:GerminationStatusCache = @{}
     $script:CoordCache = @{}
     $script:GerminationSpeciesCache = @()
     $script:SelectedGerminationSpeciesId = ''
@@ -599,12 +643,318 @@ function Load-ExperimentSettings {
     )
 }
 
+function Load-GerminationHistory {
+    # -------------------------------------------------------------------------
+    # 读取“发芽记录”工作表，并建立两个缓存：
+    #
+    # GerminationLogCache
+    #   保存每一次巡检的原始记录。
+    #
+    # GerminationStatusCache
+    #   按“物种编号 + 重复”汇总培养皿当前状态。
+    #
+    # 发芽率的唯一核心原始数据是：
+    #   H = 本次新增发芽
+    #
+    # I（累计发芽）和 K（当前发芽率）均视为派生结果，
+    # 当前阶段读取时不依赖它们。
+    # -------------------------------------------------------------------------
+
+    $script:GerminationLogCache = @()
+    $script:GerminationStatusCache = @{}
+
+    $defaultReplicate = [string]$script:ExperimentSettings.DefaultReplicate
+    $defaultTotalSeeds = [int]$script:ExperimentSettings.TotalSeeds
+
+    # -------------------------------------------------------------------------
+    # 1. 先根据现有样本数据建立默认培养皿状态。
+    #
+    # 即使某个物种还从未进行过发芽率巡检，
+    # 也应该存在：
+    #
+    # 001|R1 -> 0 / 50
+    # -------------------------------------------------------------------------
+
+    foreach ($entry in $script:DataCache.GetEnumerator()) {
+        $seed = $entry.Value
+
+        $speciesId = Safe-Text $seed.SpeciesId
+        $speciesName = Safe-Text $seed.SpeciesName
+
+        if ([string]::IsNullOrWhiteSpace($speciesId)) {
+            continue
+        }
+
+        $key = "$speciesId|$defaultReplicate"
+
+        if (-not $script:GerminationStatusCache.ContainsKey($key)) {
+            $script:GerminationStatusCache[$key] = [pscustomobject]@{
+                Key                  = $key
+                SpeciesId            = $speciesId
+                SpeciesName          = $speciesName
+                Replicate            = $defaultReplicate
+                TotalSeeds           = $defaultTotalSeeds
+                CumulativeGerminated = 0
+                GerminationRate      = 0.0
+                InspectionCount      = 0
+                LastInspection       = $null
+                LastNewGerminated    = $null
+            }
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # 2. 找到“发芽记录”最后一行。
+    # -------------------------------------------------------------------------
+
+    $lastCell = $null
+
+    try {
+        $lastCell = $script:GerminationLogSheet.Cells.Item(
+            $script:GerminationLogSheet.Rows.Count,
+            2
+        ).End(-4162)
+
+        $lastRow = [int]$lastCell.Row
+    }
+    finally {
+        Release-Com $lastCell
+    }
+
+    # 只有表头，没有历史数据。
+    if ($lastRow -lt 2) {
+        Perf-Log (
+            "发芽记录：0 条；" +
+            "培养皿状态=$($script:GerminationStatusCache.Count)"
+        )
+
+        return
+    }
+
+    # -------------------------------------------------------------------------
+    # 3. 一次性读取 A:L，避免逐单元格 COM 调用。
+    # -------------------------------------------------------------------------
+
+    $range = $null
+
+    try {
+        $range = $script:GerminationLogSheet.Range(
+            "A2:L$lastRow"
+        )
+
+        $values = $range.Value2
+    }
+    finally {
+        Release-Com $range
+    }
+
+    $records = New-Object System.Collections.ArrayList
+
+    $lower = $values.GetLowerBound(0)
+    $upper = $values.GetUpperBound(0)
+
+    # -------------------------------------------------------------------------
+    # 4. 逐条解析巡检记录。
+    # -------------------------------------------------------------------------
+
+    for ($i = $lower; $i -le $upper; $i++) {
+        $excelRow = 2 + ($i - $lower)
+
+        $recordId = Safe-Text ($values.GetValue($i, 1))
+        $speciesId = Safe-Text ($values.GetValue($i, 2))
+        $speciesName = Safe-Text ($values.GetValue($i, 3))
+        $replicate = Safe-Text ($values.GetValue($i, 4))
+
+        $placedDateRaw = $values.GetValue($i, 5)
+        $inspectionRaw = $values.GetValue($i, 6)
+
+        $newRaw = $values.GetValue($i, 8)
+        $totalSeedsRaw = $values.GetValue($i, 10)
+
+        $note = Safe-Text ($values.GetValue($i, 12))
+
+        # B列为空，认为这一行没有有效记录。
+        if ([string]::IsNullOrWhiteSpace($speciesId)) {
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($replicate)) {
+            $replicate = $defaultReplicate
+        }
+
+        # ---------------------------------------------------------------------
+        # 本次新增发芽必须是 >= 0 的整数。
+        # 0 是合法值，表示“已巡检，但无新增发芽”。
+        # ---------------------------------------------------------------------
+
+        $newGerminated = 0
+
+        if (
+            $null -eq $newRaw -or
+            (Safe-Text $newRaw) -eq '' -or
+            -not [int]::TryParse(
+                (Safe-Text $newRaw),
+                [ref]$newGerminated
+            ) -or
+            $newGerminated -lt 0
+        ) {
+            throw (
+                "【发芽记录】第 $excelRow 行：" +
+                "【本次新增发芽】必须为大于等于 0 的整数。"
+            )
+        }
+
+        # ---------------------------------------------------------------------
+        # 每条历史记录保存当时总种子数。
+        # 若旧记录为空，则兼容性回退到当前试验设置。
+        # ---------------------------------------------------------------------
+
+        $totalSeeds = $defaultTotalSeeds
+        $totalSeedsText = Safe-Text $totalSeedsRaw
+
+        if (-not [string]::IsNullOrWhiteSpace($totalSeedsText)) {
+            if (
+                -not [int]::TryParse(
+                    $totalSeedsText,
+                    [ref]$totalSeeds
+                ) -or
+                $totalSeeds -le 0
+            ) {
+                throw (
+                    "【发芽记录】第 $excelRow 行：" +
+                    "【总种子数】必须为大于 0 的整数。"
+                )
+            }
+        }
+
+        $inspectionTime = ExcelDate-ToDateTime $inspectionRaw
+        $placedDate = ExcelDate-ToDateTime $placedDateRaw
+
+        if ($null -eq $inspectionTime) {
+            throw (
+                "【发芽记录】第 $excelRow 行：" +
+                "【巡检时间】不是有效日期时间。"
+            )
+        }
+
+        $key = "$speciesId|$replicate"
+
+        # ---------------------------------------------------------------------
+        # 如果未来出现 R2、R3，而默认状态中还不存在，
+        # 在读到历史记录时自动建立。
+        # ---------------------------------------------------------------------
+
+        if (-not $script:GerminationStatusCache.ContainsKey($key)) {
+            $script:GerminationStatusCache[$key] = [pscustomobject]@{
+                Key                  = $key
+                SpeciesId            = $speciesId
+                SpeciesName          = $speciesName
+                Replicate            = $replicate
+                TotalSeeds           = $totalSeeds
+                CumulativeGerminated = 0
+                GerminationRate      = 0.0
+                InspectionCount      = 0
+                LastInspection       = $null
+                LastNewGerminated    = $null
+            }
+        }
+
+        $status = $script:GerminationStatusCache[$key]
+
+        # 同一培养皿的总种子数在实验过程中不能改变。
+        if (
+            $status.InspectionCount -gt 0 -and
+            [int]$status.TotalSeeds -ne $totalSeeds
+        ) {
+            throw (
+                "【发芽记录】第 $excelRow 行：" +
+                "$speciesId / $replicate 的总种子数与此前记录不一致。"
+            )
+        }
+
+        if ($status.InspectionCount -eq 0) {
+            $status.TotalSeeds = $totalSeeds
+        }
+
+        # 如果日志中有更完整的物种名称，则补充状态缓存。
+        if (
+            [string]::IsNullOrWhiteSpace($status.SpeciesName) -and
+            -not [string]::IsNullOrWhiteSpace($speciesName)
+        ) {
+            $status.SpeciesName = $speciesName
+        }
+
+        $record = [pscustomobject]@{
+            Row            = $excelRow
+            RecordId       = $recordId
+            SpeciesId      = $speciesId
+            SpeciesName    = $speciesName
+            Replicate      = $replicate
+            PlacedDate     = $placedDate
+            InspectionTime = $inspectionTime
+            NewGerminated  = $newGerminated
+            TotalSeeds     = $totalSeeds
+            Note           = $note
+        }
+
+        [void]$records.Add($record)
+
+        # ---------------------------------------------------------------------
+        # 累计值只由“本次新增发芽”重新计算。
+        # 不依赖 Excel I列“累计发芽”。
+        # ---------------------------------------------------------------------
+
+        $status.CumulativeGerminated += $newGerminated
+        $status.InspectionCount++
+
+        if ($status.CumulativeGerminated -gt $status.TotalSeeds) {
+            throw (
+                "【发芽记录】第 $excelRow 行：" +
+                "$speciesId / $replicate 累计发芽数 " +
+                "$($status.CumulativeGerminated) 已超过总种子数 " +
+                "$($status.TotalSeeds)。"
+            )
+        }
+
+        # 最近一次巡检不依赖 Excel 行顺序，而按实际时间判断。
+        if (
+            $null -eq $status.LastInspection -or
+            $inspectionTime -gt $status.LastInspection
+        ) {
+            $status.LastInspection = $inspectionTime
+            $status.LastNewGerminated = $newGerminated
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # 5. 最后统一计算当前发芽率。
+    # -------------------------------------------------------------------------
+
+    foreach ($status in $script:GerminationStatusCache.Values) {
+        if ($status.TotalSeeds -gt 0) {
+            $status.GerminationRate =
+            [double]$status.CumulativeGerminated /
+            [double]$status.TotalSeeds
+        }
+        else {
+            $status.GerminationRate = 0.0
+        }
+    }
+
+    $script:GerminationLogCache = @($records)
+
+    Perf-Log (
+        "发芽记录=$($script:GerminationLogCache.Count)，" +
+        "培养皿状态=$($script:GerminationStatusCache.Count)"
+    )
+}
+
 function Rebuild-Cache {
     # 性能关键点：
     # Excel 只在这里批量读取一次，之后所有查询/筛选都在内存完成。
 
     Perf-Log 'Rebuild-Cache 开始'
-    
+
     Load-ExperimentSettings
 
     $script:DataCache = @{}
@@ -664,6 +1014,12 @@ function Rebuild-Cache {
             }
         }
     }
+
+    # -------------------------------------------------------------------------
+    # 5.1B 发芽历史与培养皿当前状态
+    # -------------------------------------------------------------------------
+
+    Load-GerminationHistory
 
     # -------------------------------------------------------------------------
     # 5.2 从“测定时间计划表”备注列 N 读取原始坐标
