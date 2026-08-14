@@ -189,6 +189,40 @@ function Test-GerminatedValue($Value) {
     return $true
 }
 
+function Normalize-SpeciesId($Value) {
+    # 统一物种编号格式。
+    #
+    # Excel 可能把文本 001 自动保存为数字 1。
+    # 对纯数字编号统一恢复为至少三位：
+    #
+    # 1   -> 001
+    # 12  -> 012
+    # 123 -> 123
+    #
+    # 非纯数字编号保持原样。
+
+    $text = Safe-Text $Value
+
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return ''
+    }
+
+    if ($text -match '^\d+$') {
+        $number = 0
+
+        if (
+            [int]::TryParse(
+                $text,
+                [ref]$number
+            )
+        ) {
+            return $number.ToString('000')
+        }
+    }
+
+    return $text
+}
+
 function Get-SpeciesIdFromSampleId([string]$SampleId) {
     # 直接从样本ID解析物种编号，保留 003 这样的前导零。
     $sid = $SampleId.Trim()
@@ -684,7 +718,30 @@ function Load-GerminationHistory {
         if ([string]::IsNullOrWhiteSpace($speciesId)) {
             continue
         }
+        $speciesExists = $false
 
+        foreach (
+            $dataItem in
+            $script:DataCache.Values
+        ) {
+
+            if (
+                $dataItem.SpeciesId -eq
+                $speciesId
+            ) {
+
+                $speciesExists = $true
+                break
+            }
+        }
+
+        if (-not $speciesExists) {
+            throw (
+                "【发芽记录】第 $excelRow 行：" +
+                "物种编号 $speciesId 不存在于当前实验样本中。"
+            )
+        }
+        
         $key = "$speciesId|$defaultReplicate"
 
         if (-not $script:GerminationStatusCache.ContainsKey($key)) {
@@ -761,7 +818,10 @@ function Load-GerminationHistory {
         $excelRow = 2 + ($i - $lower)
 
         $recordId = Safe-Text ($values.GetValue($i, 1))
-        $speciesId = Safe-Text ($values.GetValue($i, 2))
+        $speciesId =
+        Normalize-SpeciesId (
+            $values.GetValue($i, 2)
+        )
         $speciesName = Safe-Text ($values.GetValue($i, 3))
         $replicate = Safe-Text ($values.GetValue($i, 4))
 
@@ -1277,7 +1337,7 @@ function Rebuild-Cache {
     }
 
 
-    $incompleteSpecies =
+    $allSpecies =
     New-Object `
         System.Collections.ArrayList
 
@@ -1290,15 +1350,7 @@ function Rebuild-Cache {
         $group =
         $speciesMap[$speciesId]
 
-        # 满10个以后自动退出发芽巡检
-        if (
-            $group.GerminatedCount -ge
-            $group.TotalCount
-        ) {
-            continue
-        }
-
-        [void]$incompleteSpecies.Add(
+        [void]$allSpecies.Add(
 
             [pscustomobject]@{
 
@@ -1315,8 +1367,11 @@ function Rebuild-Cache {
                 $group.GerminatedCount
 
                 RemainingCount    =
-                $group.TotalCount -
-                $group.GerminatedCount
+                [Math]::Max(
+                    0,
+                    $group.TotalCount -
+                    $group.GerminatedCount
+                )
 
                 MissingCoordCount =
                 $group.MissingCoordCount
@@ -1328,8 +1383,11 @@ function Rebuild-Cache {
     }
 
 
+    # v0.7：
+    # 即使前10个根苗长样本已经取满，
+    # 物种仍需继续参加发芽率巡检。
     $script:GerminationSpeciesCache =
-    @($incompleteSpecies)
+    @($allSpecies)
 
     # -------------------------------------------------------------------------
     # 5.4 测定时间计划表：A:N
@@ -2728,12 +2786,12 @@ $gSplit.Panel1.Controls.Add($gSpeciesGrid)
 
 [void]$gSpeciesGrid.Columns.Add(
     'gProgress',
-    '已发芽'
+    '发芽进度'
 )
 
 [void]$gSpeciesGrid.Columns.Add(
     'gRemaining',
-    '还需'
+    '测定样本'
 )
 
 [void]$gSpeciesGrid.Columns.Add(
@@ -2744,23 +2802,23 @@ $gSplit.Panel1.Controls.Add($gSpeciesGrid)
 
 $gSpeciesGrid.Columns[
 'gSpeciesId'
-].Width = 90
+].Width = 85
 
 $gSpeciesGrid.Columns[
 'gSpeciesName'
-].Width = 210
+].Width = 180
 
 $gSpeciesGrid.Columns[
 'gProgress'
-].Width = 80
+].Width = 135
 
 $gSpeciesGrid.Columns[
 'gRemaining'
-].Width = 70
+].Width = 90
 
 $gSpeciesGrid.Columns[
 'gMissingCoord'
-].Width = 80
+].Width = 85
 
 foreach (
     $columnName in
@@ -3483,49 +3541,35 @@ function Get-VisibleGerminationSpecies {
 
 function Get-TodayNewGerminationCount {
 
+    # v0.7：
+    # 今日新增必须来自“发芽记录”的培养皿级巡检日志，
+    # 不再只统计前10个根苗长测定样本。
+
     $today =
     (Get-Date).Date
 
     $count = 0
 
     foreach (
-        $seed in
-        $script:DataCache.Values
+        $record in
+        @($script:GerminationLogCache)
     ) {
 
-        $isGerminated =
-        Test-GerminatedValue `
-            $seed.Germination
-
-        if (-not $isGerminated) {
+        if (
+            $null -eq
+            $record.InspectionTime
+        ) {
             continue
         }
 
-        try {
+        if (
+            $record.InspectionTime.Date -eq
+            $today
+        ) {
 
-            if (
-                $seed.Germination -is
-                [double]
-            ) {
-
-                $date =
-                [DateTime]::FromOADate(
-                    [double]$seed.Germination
-                ).Date
-            }
-            else {
-
-                $date =
-                [DateTime]::Parse(
-                    [string]$seed.Germination
-                ).Date
-            }
-
-            if ($date -eq $today) {
-                $count++
-            }
+            $count +=
+            [int]$record.NewGerminated
         }
-        catch {}
     }
 
     return $count
@@ -3534,30 +3578,43 @@ function Get-TodayNewGerminationCount {
 
 function Refresh-GerminationStats {
 
-    $speciesCount =
-    $script:GerminationSpeciesCache.Count
+    $dishCount =
+    $script:GerminationStatusCache.Count
 
-    $remainingCount = 0
+    $totalSeeds = 0
+    $germinatedSeeds = 0
     $missingCoordCount = 0
+
+    foreach (
+        $status in
+        $script:GerminationStatusCache.Values
+    ) {
+
+        $totalSeeds +=
+        [int]$status.TotalSeeds
+
+        $germinatedSeeds +=
+        [int]$status.CumulativeGerminated
+    }
+
 
     foreach (
         $item in
         @($script:GerminationSpeciesCache)
     ) {
 
-        $remainingCount +=
-        $item.RemainingCount
-
         $missingCoordCount +=
-        $item.MissingCoordCount
+        [int]$item.MissingCoordCount
     }
+
 
     $todayNew =
     Get-TodayNewGerminationCount
 
+
     $gStats.Text =
-    "待检查物种 $speciesCount   |   " +
-    "还需发芽样本 $remainingCount   |   " +
+    "培养皿 $dishCount   |   " +
+    "累计发芽 $germinatedSeeds/$totalSeeds   |   " +
     "今日新增 $todayNew   |   " +
     "未记坐标 $missingCoordCount"
 }
@@ -3585,12 +3642,56 @@ function Refresh-GerminationSpeciesGrid(
 
         foreach ($item in $items) {
 
+            $statusKey =
+            "$($item.SpeciesId)|$($script:ExperimentSettings.DefaultReplicate)"
+
+            $germinated = 0
+            $totalSeeds =
+            [int]$script:ExperimentSettings.TotalSeeds
+
+            $rate = 0.0
+
+
+            if (
+                $script:GerminationStatusCache.ContainsKey(
+                    $statusKey
+                )
+            ) {
+
+                $germinationStatus =
+                $script:GerminationStatusCache[
+                $statusKey
+                ]
+
+                $germinated =
+                [int]$germinationStatus.CumulativeGerminated
+
+                $totalSeeds =
+                [int]$germinationStatus.TotalSeeds
+
+                $rate =
+                [double]$germinationStatus.GerminationRate
+            }
+
+
+            $rateText =
+            '{0:N2}%' -f ($rate * 100)
+
+
+            $germinationProgress =
+            "$germinated/$totalSeeds ($rateText)"
+
+
+            $sampleProgress =
+            "$($item.GerminatedCount)/$($item.TotalCount)"
+
+
             $rowIndex =
             $gSpeciesGrid.Rows.Add(
                 $item.SpeciesId,
                 $item.SpeciesName,
-                "$($item.GerminatedCount)/$($item.TotalCount)",
-                $item.RemainingCount,
+                $germinationProgress,
+                $sampleProgress,
                 $item.MissingCoordCount
             )
 
@@ -3679,7 +3780,7 @@ function Refresh-GerminationSpeciesGrid(
         ''
 
         $gSelectedTitle.Text =
-        '暂无待检查物种'
+        '暂无物种数据'
 
         $gSelectedStats.Text =
         ''
@@ -3696,7 +3797,7 @@ function Refresh-GerminationUi {
     if ($null -eq $script:Book) {
 
         $gStats.Text =
-        '待检查物种 0   |   还需发芽样本 0   |   今日新增 0   |   未记坐标 0'
+        '培养皿 0   |   累计发芽 0   |   今日新增 0   |   未记坐标 0'
 
         $gSpeciesGrid.Rows.Clear()
 
@@ -3759,10 +3860,49 @@ function Load-GerminationSpeciesDetail(
     "$($item.SpeciesName)"
 
 
+    $statusKey =
+    "$($item.SpeciesId)|$($script:ExperimentSettings.DefaultReplicate)"
+
+
+    $germinated = 0
+
+    $totalSeeds =
+    [int]$script:ExperimentSettings.TotalSeeds
+
+    $rate = 0.0
+
+
+    if (
+        $script:GerminationStatusCache.ContainsKey(
+            $statusKey
+        )
+    ) {
+
+        $germinationStatus =
+        $script:GerminationStatusCache[
+        $statusKey
+        ]
+
+        $germinated =
+        [int]$germinationStatus.CumulativeGerminated
+
+        $totalSeeds =
+        [int]$germinationStatus.TotalSeeds
+
+        $rate =
+        [double]$germinationStatus.GerminationRate
+    }
+
+
+    $rateText =
+    '{0:N2}%' -f ($rate * 100)
+
+
     $gSelectedStats.Text =
-    "已获得 $($item.GerminatedCount)/$($item.TotalCount) 个测定样本；" +
-    "还需要 $($item.RemainingCount) 个；" +
-    "已有样本未记坐标 $($item.MissingCoordCount) 个"
+    "发芽 $germinated/$totalSeeds（$rateText）   |   " +
+    "测定样本 $($item.GerminatedCount)/$($item.TotalCount)   |   " +
+    "还需样本 $($item.RemainingCount)   |   " +
+    "未记坐标 $($item.MissingCoordCount)"
 
 
     $gBatchDate.Value =
