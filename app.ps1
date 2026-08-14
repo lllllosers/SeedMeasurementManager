@@ -3776,9 +3776,9 @@ $gRecordToday.Size = New-Object Drawing.Size(170, 42)
 $gDetailBottom.Controls.Add($gRecordToday)
 
 $gNextSpecies = New-Object Windows.Forms.Button
-$gNextSpecies.Text = '下一物种 →'
+$gNextSpecies.Text = '0新增并下一物种 →'
 $gNextSpecies.Location = New-Object Drawing.Point(333, 12)
-$gNextSpecies.Size = New-Object Drawing.Size(110, 42)
+$gNextSpecies.Size = New-Object Drawing.Size(180, 42)
 $gDetailBottom.Controls.Add($gNextSpecies)
 
 $gInspectStatus = New-Object Windows.Forms.Label
@@ -5096,6 +5096,7 @@ function Record-NewGerminations {
 
         # 同时刷新今日任务和发芽巡检。
         Refresh-Ui
+        return $true
     }
     catch {
 
@@ -5109,9 +5110,61 @@ function Record-NewGerminations {
         Handle-Error `
             '保存本次发芽巡检失败' `
             $_
+            
+        return $false
     }
 }
 
+function Record-ZeroAndNextGerminationSpecies {
+
+    # -------------------------------------------------------------------------
+    # 高频操作：
+    # 当前培养皿已经检查，但本次没有新发芽。
+    #
+    # 必须真正写入一条“新增 = 0”的巡检记录，
+    # 保存成功以后才允许跳到下一物种。
+    # -------------------------------------------------------------------------
+
+    if ($null -eq $script:Book) {
+
+        Show-Error '尚未连接 Excel。'
+        return
+    }
+
+
+    if (
+        [string]::IsNullOrWhiteSpace(
+            $script:SelectedGerminationSpeciesId
+        )
+    ) {
+
+        Show-Error '请先选择一个物种。'
+        return
+    }
+
+
+    # 强制本次新增为0。
+    $gNewCount.Text =
+    '0'
+
+
+    # 0新增不需要坐标。
+    $gNewCoords.Clear()
+
+
+    Update-GerminationCoordinateHint
+
+
+    $saved =
+    Record-NewGerminations
+
+
+    # 只有真正保存成功才跳下一物种。
+    if ($saved) {
+
+        Select-NextGerminationSpecies
+    }
+}
 
 function Select-NextGerminationSpecies {
 
@@ -5555,11 +5608,14 @@ $gNewCoords.Add_KeyDown({
     })
 
 
-# 今天没有新增，跳下一物种
+# 今天已经检查，但没有新增发芽：
+# 保存一条“新增=0”的有效巡检记录，
+# 成功后自动进入下一物种。
 $gNextSpecies.Add_Click({
 
-        Select-NextGerminationSpecies
+        Record-ZeroAndNextGerminationSpecies
     })
+    
 # -------------------------------------------------------------------------
 # 15.4 根苗长录入：全键盘连续录入
 # -------------------------------------------------------------------------
