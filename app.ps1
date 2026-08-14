@@ -741,7 +741,7 @@ function Load-GerminationHistory {
                 "物种编号 $speciesId 不存在于当前实验样本中。"
             )
         }
-        
+
         $key = "$speciesId|$defaultReplicate"
 
         if (-not $script:GerminationStatusCache.ContainsKey($key)) {
@@ -750,6 +750,7 @@ function Load-GerminationHistory {
                 SpeciesId            = $speciesId
                 SpeciesName          = $speciesName
                 Replicate            = $defaultReplicate
+                PlacedDate           = $null
                 TotalSeeds           = $defaultTotalSeeds
                 CumulativeGerminated = 0
                 GerminationRate      = 0.0
@@ -910,6 +911,7 @@ function Load-GerminationHistory {
                 SpeciesId            = $speciesId
                 SpeciesName          = $speciesName
                 Replicate            = $replicate
+                PlacedDate           = $null
                 TotalSeeds           = $totalSeeds
                 CumulativeGerminated = 0
                 GerminationRate      = 0.0
@@ -920,6 +922,37 @@ function Load-GerminationHistory {
         }
 
         $status = $script:GerminationStatusCache[$key]
+
+        # ---------------------------------------------------------------------
+        # 置床日期属于培养皿，而不是单个测定样本。
+        # 第一条历史记录确定该培养皿的置床日期；
+        # 后续历史记录必须保持一致。
+        # ---------------------------------------------------------------------
+
+        if ($null -eq $placedDate) {
+
+            throw (
+                "【发芽记录】第 $excelRow 行：" +
+                "【置床日期】不能为空。"
+            )
+        }
+
+
+        if ($null -eq $status.PlacedDate) {
+
+            $status.PlacedDate =
+            $placedDate.Date
+        }
+        elseif (
+            ([DateTime]$status.PlacedDate).Date -ne
+            $placedDate.Date
+        ) {
+
+            throw (
+                "【发芽记录】第 $excelRow 行：" +
+                "$speciesId / $replicate 的置床日期与此前记录不一致。"
+            )
+        }
 
         # 同一培养皿的总种子数在实验过程中不能改变。
         if (
@@ -1070,6 +1103,7 @@ function Rebuild-Cache {
                 SpeciesId   = Get-SpeciesIdFromSampleId $sampleId
                 SpeciesName = Safe-Text ($values.GetValue($i, 2))
                 SeedNo      = Safe-Text ($values.GetValue($i, 3))
+                PlacedDate  = $values.GetValue($i, 5)
                 Germination = $values.GetValue($i, 6)
             }
         }
@@ -1850,14 +1884,48 @@ function Save-CoordinateBackfill(
     Rebuild-Cache
 }
 
-function Save-GerminationsByCoordinate(
-    [string]$SpeciesId,
-    [string[]]$Coordinates,
-    [DateTime]$DateValue
+function Get-NextGerminationRecordId {
+
+    $maxNumber = 0
+
+    foreach (
+        $record in
+        @($script:GerminationLogCache)
+    ) {
+
+        $recordId =
+        Safe-Text $record.RecordId
+
+        if (
+            $recordId -match
+            '^G(\d+)$'
+        ) {
+
+            $number = 0
+
+            if (
+                [int]::TryParse(
+                    $Matches[1],
+                    [ref]$number
+                )
+            ) {
+
+                if ($number -gt $maxNumber) {
+                    $maxNumber = $number
+                }
+            }
+        }
+    }
+
+    return (
+        'G{0:D6}' -f
+        ($maxNumber + 1)
+    )
+}
+
+function Get-GerminationSpeciesItem(
+    [string]$SpeciesId
 ) {
-
-    $species = $null
-
 
     foreach (
         $item in
@@ -1869,34 +1937,174 @@ function Save-GerminationsByCoordinate(
             $SpeciesId
         ) {
 
-            $species = $item
+            return $item
+        }
+    }
 
-            break
+    throw (
+        '发芽巡检中未找到物种：' +
+        $SpeciesId
+    )
+}
+
+function Get-SpeciesPlacedDate(
+    [string]$SpeciesId,
+    [string]$Replicate
+) {
+
+    $key =
+    "$SpeciesId|$Replicate"
+
+
+    # -------------------------------------------------------------------------
+    # 第一优先级：
+    # 已有发芽历史记录中的置床日期。
+    # -------------------------------------------------------------------------
+
+    if (
+        $script:GerminationStatusCache.ContainsKey(
+            $key
+        )
+    ) {
+
+        $status =
+        $script:GerminationStatusCache[
+        $key
+        ]
+
+
+        if ($null -ne $status.PlacedDate) {
+
+            return (
+                [DateTime]$status.PlacedDate
+            ).Date
         }
     }
 
 
-    if ($null -eq $species) {
+    # -------------------------------------------------------------------------
+    # 第二优先级：
+    # 原有“根-苗长统计表”中的置床日期。
+    #
+    # 同一物种的测定样本共享一个置床日期，
+    # 因此只要找到一个有效值即可。
+    # -------------------------------------------------------------------------
+
+    foreach (
+        $seed in
+        $script:DataCache.Values
+    ) {
+
+        if (
+            $seed.SpeciesId -ne
+            $SpeciesId
+        ) {
+            continue
+        }
+
+
+        $candidate =
+        ExcelDate-ToDateTime `
+            $seed.PlacedDate
+
+
+        if ($null -ne $candidate) {
+
+            return $candidate.Date
+        }
+    }
+
+
+    return $null
+}
+function Save-GerminationInspection(
+    [string]$SpeciesId,
+    [int]$NewGerminated,
+    [string[]]$Coordinates,
+    [DateTime]$PlacedDateValue,
+    [DateTime]$DateValue
+) {
+
+    if ($null -eq $script:Book) {
+        throw '尚未连接 Excel。'
+    }
+
+
+    $species =
+    Get-GerminationSpeciesItem `
+        $SpeciesId
+
+
+    $replicate =
+    [string]$script:ExperimentSettings.DefaultReplicate
+
+
+    $statusKey =
+    "$SpeciesId|$replicate"
+
+
+    if (
+        -not
+        $script:GerminationStatusCache.ContainsKey(
+            $statusKey
+        )
+    ) {
 
         throw (
-            '当前物种已经获得10个测定样本，' +
-            '或不在发芽巡检列表中。'
+            '未找到当前培养皿的发芽状态：' +
+            $statusKey
+        )
+    }
+
+
+    $status =
+    $script:GerminationStatusCache[
+    $statusKey
+    ]
+
+
+    $totalSeeds =
+    [int]$status.TotalSeeds
+
+
+    $currentGerminated =
+    [int]$status.CumulativeGerminated
+
+
+    # -------------------------------------------------------------------------
+    # 1. 校验新增发芽数
+    # -------------------------------------------------------------------------
+
+    if ($NewGerminated -lt 0) {
+
+        throw (
+            '本次新增发芽数不能小于 0。'
+        )
+    }
+
+
+    $newCumulative =
+    $currentGerminated +
+    $NewGerminated
+
+
+    if (
+        $newCumulative -gt
+        $totalSeeds
+    ) {
+
+        throw (
+            '保存后累计发芽数将达到 ' +
+            $newCumulative +
+            ' 粒，超过总种子数 ' +
+            $totalSeeds +
+            ' 粒。'
         )
     }
 
 
     # -------------------------------------------------------------------------
-    # 找出下一个尚未使用的测定样本槽位
-    #
-    # 例如：
-    # 已有001-1～001-3
-    #
-    # 今天输入：
-    # C7 E9
-    #
-    # 自动得到：
-    # 001-4 = C7
-    # 001-5 = E9
+    # 2. 找出尚未分配的根苗长测定样本槽位
     # -------------------------------------------------------------------------
 
     $blankSlots =
@@ -1925,45 +2133,80 @@ function Save-GerminationsByCoordinate(
     )
 
 
-    if (
-        $Coordinates.Count -gt
-        $blankSlots.Count
+    # 本次实际需要记录坐标的数量：
+    #
+    # 新增3粒、还缺10个样本 -> 需要3个坐标
+    # 新增8粒、还缺3个样本  -> 需要3个坐标
+    # 已经10/10              -> 需要0个坐标
+    $requiredCoordinateCount =
+    [Math]::Min(
+        [int]$NewGerminated,
+        [int]$blankSlots.Count
+    )
+
+
+    # -------------------------------------------------------------------------
+    # 3. 规范并检查坐标
+    # -------------------------------------------------------------------------
+
+    $coordList =
+    New-Object `
+        System.Collections.ArrayList
+
+
+    foreach (
+        $coordRaw in
+        @($Coordinates)
     ) {
 
-        throw (
-            '当前还需要 ' +
-            $blankSlots.Count +
-            ' 个测定样本，但输入了 ' +
-            $Coordinates.Count +
-            ' 个坐标。'
+        if (
+            [string]::IsNullOrWhiteSpace(
+                [string]$coordRaw
+            )
+        ) {
+            continue
+        }
+
+
+        $coord =
+        Normalize-GerminationCoordinate `
+        ([string]$coordRaw)
+
+
+        [void]$coordList.Add(
+            $coord
         )
     }
 
 
-    # -------------------------------------------------------------------------
-    # 检查当前培养皿内部坐标是否重复
-    #
-    # 不同物种之间允许使用同一个坐标：
-    # 001可以有E5
-    # 009也可以有E5
-    # -------------------------------------------------------------------------
+    if (
+        $coordList.Count -ne
+        $requiredCoordinateCount
+    ) {
+
+        throw (
+            '本次新增发芽 ' +
+            $NewGerminated +
+            ' 粒；当前还缺 ' +
+            $blankSlots.Count +
+            ' 个测定样本，因此需要填写 ' +
+            $requiredCoordinateCount +
+            ' 个坐标。当前填写了 ' +
+            $coordList.Count +
+            ' 个。'
+        )
+    }
+
 
     $used =
     Get-UsedCoordinateMap `
         $SpeciesId
 
+
     $newUsed = @{}
 
 
-    foreach (
-        $coordRaw in
-        $Coordinates
-    ) {
-
-        $coord =
-        Normalize-GerminationCoordinate `
-            $coordRaw
-
+    foreach ($coord in $coordList) {
 
         if ($used.ContainsKey($coord)) {
 
@@ -1991,28 +2234,137 @@ function Save-GerminationsByCoordinate(
 
 
     # -------------------------------------------------------------------------
-    # 写入
+    # 4. 获取培养皿级置床日期
     # -------------------------------------------------------------------------
 
-    $oaDate =
-    [double]$DateValue.Date.ToOADate()
+    $placedDate =
+    Get-SpeciesPlacedDate `
+        $SpeciesId `
+        $replicate
 
 
-    $result =
+    # 已有历史数据时，以历史置床日期为准。
+    # 第一次巡检时，则采用界面中设置的置床日期。
+    if ($null -eq $placedDate) {
+
+        $placedDate =
+        $PlacedDateValue.Date
+    }
+    else {
+
+        $placedDate =
+        ([DateTime]$placedDate).Date
+    }
+
+
+    $inspectionDate =
+    $DateValue.Date
+
+    if (
+        $placedDate.Date -gt
+        (Get-Date).Date
+    ) {
+
+        throw (
+            '置床日期不能晚于今天。'
+        )
+    }
+
+    if (
+        $inspectionDate -lt
+        $placedDate.Date
+    ) {
+
+        throw (
+            '巡检日期不能早于置床日期。'
+        )
+    }
+
+
+    # 日期来自界面；
+    # 时间使用实际保存时刻。
+    $inspectionTime =
+    $inspectionDate.Add(
+        (Get-Date).TimeOfDay
+    )
+
+
+    $daysAfterPlacement =
+    [int](
+        $inspectionDate -
+        $placedDate.Date
+    ).TotalDays
+
+
+    $newRate =
+    if ($totalSeeds -gt 0) {
+
+        [double]$newCumulative /
+        [double]$totalSeeds
+    }
+    else {
+
+        0.0
+    }
+
+
+    $recordId =
+    Get-NextGerminationRecordId
+
+
+    # -------------------------------------------------------------------------
+    # 5. 计算“发芽记录”下一行
+    # -------------------------------------------------------------------------
+
+    $lastCell = $null
+
+    try {
+
+        $lastCell =
+        $script:GerminationLogSheet.Cells.Item(
+            $script:GerminationLogSheet.Rows.Count,
+            2
+        ).End(-4162)
+
+
+        $lastRow =
+        [int]$lastCell.Row
+    }
+    finally {
+
+        Release-Com $lastCell
+    }
+
+
+    if ($lastRow -lt 2) {
+
+        $nextRow = 2
+    }
+    else {
+
+        $nextRow =
+        $lastRow + 1
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 6. 正式写入前10个测定样本
+    # -------------------------------------------------------------------------
+
+    $oaGerminationDate =
+    [double]$inspectionDate.ToOADate()
+
+
+    $assignments =
     New-Object `
         System.Collections.ArrayList
 
 
     for (
         $i = 0;
-        $i -lt $Coordinates.Count;
+        $i -lt $requiredCoordinateCount;
         $i++
     ) {
-
-        $coord =
-        Normalize-GerminationCoordinate `
-            $Coordinates[$i]
-
 
         $slot =
         $blankSlots[$i]
@@ -2022,10 +2374,11 @@ function Save-GerminationsByCoordinate(
         [string]$slot.SampleId
 
 
-        # -------------------------------------------------------------
-        # 根-苗长统计表 F列：发芽日期
-        # -------------------------------------------------------------
+        $coord =
+        [string]$coordList[$i]
 
+
+        # 根-苗长统计表 F列：发芽日期
         $dataRow =
         [int]$script:DataCache[
         $sampleId
@@ -2036,7 +2389,7 @@ function Save-GerminationsByCoordinate(
             $script:DataSheet `
             $dataRow `
             6 `
-            $oaDate
+            $oaGerminationDate
 
 
         $dateCell = $null
@@ -2058,10 +2411,7 @@ function Save-GerminationsByCoordinate(
         }
 
 
-        # -------------------------------------------------------------
         # 测定时间计划表 N列：原始坐标
-        # -------------------------------------------------------------
-
         if (
             -not
             $script:PlanCache.ContainsKey(
@@ -2089,7 +2439,7 @@ function Save-GerminationsByCoordinate(
             $coord
 
 
-        [void]$result.Add(
+        [void]$assignments.Add(
 
             [pscustomobject]@{
 
@@ -2103,9 +2453,166 @@ function Save-GerminationsByCoordinate(
     }
 
 
-    # DAG等公式重新计算
-    $script:PlanSheet.Calculate()
+    # -------------------------------------------------------------------------
+    # 7. 写入“发芽记录”A:L
+    # -------------------------------------------------------------------------
 
+    # B列强制文本，确保001不会变成1
+    $speciesIdCell = $null
+
+    try {
+
+        $speciesIdCell =
+        $script:GerminationLogSheet.Cells.Item(
+            $nextRow,
+            2
+        )
+
+        $speciesIdCell.NumberFormat =
+        '@'
+    }
+    finally {
+
+        Release-Com $speciesIdCell
+    }
+
+
+    Set-CellValue `
+        $script:GerminationLogSheet `
+        $nextRow `
+        1 `
+        $recordId
+
+    Set-CellValue `
+        $script:GerminationLogSheet `
+        $nextRow `
+        2 `
+    ([string]$SpeciesId)
+
+    Set-CellValue `
+        $script:GerminationLogSheet `
+        $nextRow `
+        3 `
+    ([string]$species.SpeciesName)
+
+    Set-CellValue `
+        $script:GerminationLogSheet `
+        $nextRow `
+        4 `
+        $replicate
+
+    Set-CellValue `
+        $script:GerminationLogSheet `
+        $nextRow `
+        5 `
+    ([double]$placedDate.Date.ToOADate())
+
+    Set-CellValue `
+        $script:GerminationLogSheet `
+        $nextRow `
+        6 `
+    ([double]$inspectionTime.ToOADate())
+
+    Set-CellValue `
+        $script:GerminationLogSheet `
+        $nextRow `
+        7 `
+        $daysAfterPlacement
+
+    Set-CellValue `
+        $script:GerminationLogSheet `
+        $nextRow `
+        8 `
+        $NewGerminated
+
+    Set-CellValue `
+        $script:GerminationLogSheet `
+        $nextRow `
+        9 `
+        $newCumulative
+
+    Set-CellValue `
+        $script:GerminationLogSheet `
+        $nextRow `
+        10 `
+        $totalSeeds
+
+    Set-CellValue `
+        $script:GerminationLogSheet `
+        $nextRow `
+        11 `
+        $newRate
+
+    Set-CellValue `
+        $script:GerminationLogSheet `
+        $nextRow `
+        12 `
+        $null
+
+
+    # 日期与百分比显示格式
+    $formatCell = $null
+
+    try {
+
+        $formatCell =
+        $script:GerminationLogSheet.Cells.Item(
+            $nextRow,
+            5
+        )
+
+        $formatCell.NumberFormat =
+        'yyyy/m/d'
+    }
+    finally {
+
+        Release-Com $formatCell
+    }
+
+
+    $formatCell = $null
+
+    try {
+
+        $formatCell =
+        $script:GerminationLogSheet.Cells.Item(
+            $nextRow,
+            6
+        )
+
+        $formatCell.NumberFormat =
+        'yyyy/m/d h:mm'
+    }
+    finally {
+
+        Release-Com $formatCell
+    }
+
+
+    $formatCell = $null
+
+    try {
+
+        $formatCell =
+        $script:GerminationLogSheet.Cells.Item(
+            $nextRow,
+            11
+        )
+
+        $formatCell.NumberFormat =
+        '0.00%'
+    }
+    finally {
+
+        Release-Com $formatCell
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 8. 统一计算、保存、重建缓存
+    # -------------------------------------------------------------------------
+
+    $script:PlanSheet.Calculate()
 
     $script:Book.Save()
 
@@ -2113,7 +2620,7 @@ function Save-GerminationsByCoordinate(
     if (-not $script:Book.Saved) {
 
         throw (
-            '发芽数据没有成功保存到Excel。'
+            '本次发芽巡检数据没有成功保存到 Excel。'
         )
     }
 
@@ -2121,9 +2628,27 @@ function Save-GerminationsByCoordinate(
     Rebuild-Cache
 
 
-    return @($result)
-}
+    return [pscustomobject]@{
 
+        RecordId             =
+        $recordId
+
+        NewGerminated        =
+        $NewGerminated
+
+        CumulativeGerminated =
+        $newCumulative
+
+        TotalSeeds           =
+        $totalSeeds
+
+        GerminationRate      =
+        $newRate
+
+        AssignedSamples      =
+        @($assignments)
+    }
+}
 
 function Parse-Measure([string]$Text) {
     # 根/苗长输入统一校验：
@@ -2848,7 +3373,7 @@ $gSplit.Panel2.Controls.Add($gDetailLayout)
 
 $gDetailRow1 = New-Object Windows.Forms.RowStyle
 $gDetailRow1.SizeType = [Windows.Forms.SizeType]::Absolute
-$gDetailRow1.Height = 180
+$gDetailRow1.Height = 255
 [void]$gDetailLayout.RowStyles.Add($gDetailRow1)
 
 $gDetailRow2 = New-Object Windows.Forms.RowStyle
@@ -2884,16 +3409,164 @@ $gSelectedStats.Font = $script:UiFont.Body
 $gSelectedStats.ForeColor = $script:UiPalette.TextSecondary
 $gDetailTop.Controls.Add($gSelectedStats)
 
+$gPlacedDateLabel =
+New-Object Windows.Forms.Label
+
+$gPlacedDateLabel.Text =
+'置床日期'
+
+$gPlacedDateLabel.Location =
+New-Object Drawing.Point(
+    20,
+    91
+)
+
+$gPlacedDateLabel.AutoSize =
+$true
+
+$gDetailTop.Controls.Add(
+    $gPlacedDateLabel
+)
+
+
+$gPlacedDate =
+New-Object Windows.Forms.DateTimePicker
+
+$gPlacedDate.Format =
+'Custom'
+
+$gPlacedDate.CustomFormat =
+'yyyy/M/d'
+
+$gPlacedDate.Value =
+(Get-Date).Date
+
+$gPlacedDate.Location =
+New-Object Drawing.Point(
+    140,
+    84
+)
+
+$gPlacedDate.Size =
+New-Object Drawing.Size(
+    160,
+    30
+)
+
+$gPlacedDate.Font =
+$script:UiFont.Input
+
+$gDetailTop.Controls.Add(
+    $gPlacedDate
+)
+
+
+$gPlacedDateHint =
+New-Object Windows.Forms.Label
+
+$gPlacedDateHint.Text =
+'首次巡检时设置一次'
+
+$gPlacedDateHint.Location =
+New-Object Drawing.Point(
+    315,
+    91
+)
+
+$gPlacedDateHint.AutoSize =
+$true
+
+$gPlacedDateHint.ForeColor =
+$script:UiPalette.TextSecondary
+
+$gPlacedDateHint.Font =
+$script:UiFont.Small
+
+$gDetailTop.Controls.Add(
+    $gPlacedDateHint
+)
+
+$gNewCountLabel =
+New-Object Windows.Forms.Label
+
+$gNewCountLabel.Text =
+'本次新增发芽'
+
+$gNewCountLabel.Location =
+New-Object Drawing.Point(
+    20,
+    132
+)
+
+$gNewCountLabel.AutoSize =
+$true
+
+$gDetailTop.Controls.Add(
+    $gNewCountLabel
+)
+
+
+$gNewCount =
+New-Object Windows.Forms.TextBox
+
+$gNewCount.Location =
+New-Object Drawing.Point(
+    140,
+    125
+)
+
+$gNewCount.Size =
+New-Object Drawing.Size(
+    90,
+    30
+)
+
+$gNewCount.Font =
+$script:UiFont.InputStrong
+
+$gNewCount.TextAlign =
+[Windows.Forms.HorizontalAlignment]::Center
+
+$gDetailTop.Controls.Add(
+    $gNewCount
+)
+
+
+$gNewCountHint =
+New-Object Windows.Forms.Label
+
+$gNewCountHint.Text =
+'输入本次新发芽粒数；0 也可保存'
+
+$gNewCountHint.Location =
+New-Object Drawing.Point(
+    245,
+    132
+)
+
+$gNewCountHint.AutoSize =
+$true
+
+$gNewCountHint.ForeColor =
+$script:UiPalette.TextSecondary
+
+$gNewCountHint.Font =
+$script:UiFont.Small
+
+$gDetailTop.Controls.Add(
+    $gNewCountHint
+)
+
 $gNewCoordLabel =
 New-Object Windows.Forms.Label
 
 $gNewCoordLabel.Text =
-'今天新发芽坐标'
+'样本坐标'
 
 $gNewCoordLabel.Location =
 New-Object Drawing.Point(
     20,
-    91
+    132
 )
 
 $gNewCoordLabel.AutoSize =
@@ -2910,7 +3583,7 @@ New-Object Windows.Forms.TextBox
 $gNewCoords.Location =
 New-Object Drawing.Point(
     140,
-    85
+    166
 )
 
 $gNewCoords.Size =
@@ -2934,12 +3607,12 @@ $gNewCoordHint =
 New-Object Windows.Forms.Label
 
 $gNewCoordHint.Text =
-'多个位置用空格隔开，例如 E5 C7'
+'先输入本次新增粒数'
 
 $gNewCoordHint.Location =
 New-Object Drawing.Point(
     370,
-    91
+    173
 )
 
 $gNewCoordHint.AutoSize =
@@ -2954,8 +3627,8 @@ $gDetailTop.Controls.Add(
 )
 
 $gBatchDateLabel = New-Object Windows.Forms.Label
-$gBatchDateLabel.Text = '本次发芽日期'
-$gBatchDateLabel.Location = New-Object Drawing.Point(20, 132)
+$gBatchDateLabel.Text = '本次巡检日期'
+$gBatchDateLabel.Location = New-Object Drawing.Point(20, 214)
 $gBatchDateLabel.AutoSize = $true
 $gDetailTop.Controls.Add($gBatchDateLabel)
 
@@ -2963,7 +3636,7 @@ $gBatchDate = New-Object Windows.Forms.DateTimePicker
 $gBatchDate.Format = 'Custom'
 $gBatchDate.CustomFormat = 'yyyy/M/d'
 $gBatchDate.Value = (Get-Date).Date
-$gBatchDate.Location = New-Object Drawing.Point(125, 125)
+$gBatchDate.Location = New-Object Drawing.Point(140, 207)
 $gBatchDate.Size = New-Object Drawing.Size(150, 30)
 $gBatchDate.Font = $script:UiFont.Input
 $gDetailTop.Controls.Add($gBatchDate)
@@ -3097,7 +3770,7 @@ $gDetailBottom.Controls.Add(
 )
 
 $gRecordToday = New-Object Windows.Forms.Button
-$gRecordToday.Text = '记录今日新发芽'
+$gRecordToday.Text = '保存本次巡检'
 $gRecordToday.Location = New-Object Drawing.Point(153, 12)
 $gRecordToday.Size = New-Object Drawing.Size(170, 42)
 $gDetailBottom.Controls.Add($gRecordToday)
@@ -3797,7 +4470,7 @@ function Refresh-GerminationUi {
     if ($null -eq $script:Book) {
 
         $gStats.Text =
-        '培养皿 0   |   累计发芽 0   |   今日新增 0   |   未记坐标 0'
+        '培养皿 0   |   累计发芽 0/0   |   今日新增 0   |   未记坐标 0'
 
         $gSpeciesGrid.Rows.Clear()
 
@@ -3815,6 +4488,118 @@ function Refresh-GerminationUi {
         $keep
 }
 
+function Update-GerminationCoordinateHint {
+
+    $speciesId =
+    $script:SelectedGerminationSpeciesId
+
+
+    if (
+        [string]::IsNullOrWhiteSpace(
+            $speciesId
+        )
+    ) {
+        return
+    }
+
+
+    $item = $null
+
+
+    foreach (
+        $candidate in
+        @($script:GerminationSpeciesCache)
+    ) {
+
+        if (
+            $candidate.SpeciesId -eq
+            $speciesId
+        ) {
+
+            $item = $candidate
+
+            break
+        }
+    }
+
+
+    if ($null -eq $item) {
+        return
+    }
+
+
+    $remaining =
+    [int]$item.RemainingCount
+
+
+    if ($remaining -le 0) {
+
+        $gNewCoords.Clear()
+
+        $gNewCoords.Enabled =
+        $false
+
+        $gNewCoordHint.Text =
+        '测定样本已满，无需填写坐标'
+
+        return
+    }
+
+
+    $text =
+    $gNewCount.Text.Trim()
+
+
+    $newCount = 0
+
+
+    if (
+        [string]::IsNullOrWhiteSpace(
+            $text
+        ) -or
+        -not [int]::TryParse(
+            $text,
+            [ref]$newCount
+        ) -or
+        $newCount -lt 0
+    ) {
+
+        $gNewCoords.Enabled =
+        $true
+
+        $gNewCoordHint.Text =
+        "当前还缺 $remaining 个测定样本"
+
+        return
+    }
+
+
+    $required =
+    [Math]::Min(
+        $newCount,
+        $remaining
+    )
+
+
+    if ($required -eq 0) {
+
+        $gNewCoords.Clear()
+
+        $gNewCoords.Enabled =
+        $false
+
+        $gNewCoordHint.Text =
+        '本次无需填写坐标'
+    }
+    else {
+
+        $gNewCoords.Enabled =
+        $true
+
+        $gNewCoordHint.Text =
+        "本次需要填写 $required 个坐标"
+    }
+}
 
 function Load-GerminationSpeciesDetail(
     [string]$SpeciesId
@@ -3904,11 +4689,51 @@ function Load-GerminationSpeciesDetail(
     "还需样本 $($item.RemainingCount)   |   " +
     "未记坐标 $($item.MissingCoordCount)"
 
+    $replicate =
+    [string]$script:ExperimentSettings.DefaultReplicate
+
+
+    $existingPlacedDate =
+    Get-SpeciesPlacedDate `
+        $item.SpeciesId `
+        $replicate
+
+
+    if ($null -ne $existingPlacedDate) {
+
+        # 已经确定置床日期：
+        # 显示并锁定，避免后续巡检误改。
+        $gPlacedDate.Value =
+        ([DateTime]$existingPlacedDate).Date
+
+        $gPlacedDate.Enabled =
+        $false
+
+        $gPlacedDateHint.Text =
+        '已确定'
+    }
+    else {
+
+        # 首次巡检：
+        # 默认今天，但允许用户修改成实际置床日期。
+        $gPlacedDate.Value =
+        (Get-Date).Date
+
+        $gPlacedDate.Enabled =
+        $true
+
+        $gPlacedDateHint.Text =
+        '首次巡检，请确认置床日期'
+    }
 
     $gBatchDate.Value =
     (Get-Date).Date
 
+    $gNewCount.Clear()
+
     $gNewCoords.Clear()
+
+    Update-GerminationCoordinateHint
 
 
     $gSeedGrid.SuspendLayout()
@@ -4158,30 +4983,79 @@ function Record-NewGerminations {
         $speciesId =
         $script:SelectedGerminationSpeciesId
 
+
         if (
             [string]::IsNullOrWhiteSpace(
                 $speciesId
             )
         ) {
 
-            throw '请先选择一个待检查物种。'
+            throw '请先选择一个物种。'
         }
 
 
-        $coordinates =
-        @(
-            Split-GerminationCoordinates `
+        $newCountText =
+        $gNewCount.Text.Trim()
+
+
+        $newCount = 0
+
+
+        if (
+            [string]::IsNullOrWhiteSpace(
+                $newCountText
+            ) -or
+            -not [int]::TryParse(
+                $newCountText,
+                [ref]$newCount
+            ) -or
+            $newCount -lt 0
+        ) {
+
+            throw (
+                '本次新增发芽必须填写大于等于 0 的整数。'
+            )
+        }
+
+
+        $coordinates = @()
+
+
+        if (
+            -not
+            [string]::IsNullOrWhiteSpace(
                 $gNewCoords.Text
-        )
+            )
+        ) {
+
+            $coordinates =
+            @(
+                Split-GerminationCoordinates `
+                    $gNewCoords.Text
+            )
+        }
 
 
         $result =
-        @(
-            Save-GerminationsByCoordinate `
-                $speciesId `
-                $coordinates `
-                $gBatchDate.Value.Date
+        Save-GerminationInspection `
+            $speciesId `
+            $newCount `
+            $coordinates `
+            $gPlacedDate.Value.Date `
+            $gBatchDate.Value.Date
+
+
+        $rateText =
+        '{0:N2}%' -f (
+            $result.GerminationRate * 100
         )
+
+
+        $message =
+        "✓ $($result.RecordId) · " +
+        "新增 $($result.NewGerminated) · " +
+        "累计 $($result.CumulativeGerminated)/$($result.TotalSeeds) " +
+        "($rateText)"
 
 
         $mapping =
@@ -4189,11 +5063,22 @@ function Record-NewGerminations {
             System.Collections.ArrayList
 
 
-        foreach ($item in $result) {
+        foreach (
+            $assignment in
+            @($result.AssignedSamples)
+        ) {
 
             [void]$mapping.Add(
-                "$($item.SampleId)=$($item.Coordinate)"
+                "$($assignment.SampleId)=$($assignment.Coordinate)"
             )
+        }
+
+
+        if ($mapping.Count -gt 0) {
+
+            $message +=
+            ' · ' +
+            ($mapping -join '，')
         }
 
 
@@ -4201,14 +5086,15 @@ function Record-NewGerminations {
         $script:UiPalette.Success
 
         $gInspectStatus.Text =
-        '✓ 已记录：' +
-        ($mapping -join '，')
+        $message
 
+
+        $gNewCount.Clear()
 
         $gNewCoords.Clear()
 
 
-        # 这里会同时刷新今日任务和发芽巡检。
+        # 同时刷新今日任务和发芽巡检。
         Refresh-Ui
     }
     catch {
@@ -4217,10 +5103,11 @@ function Record-NewGerminations {
         $script:UiPalette.Danger
 
         $gInspectStatus.Text =
-        '发芽记录失败'
+        '发芽巡检保存失败'
+
 
         Handle-Error `
-            '记录今日新发芽失败' `
+            '保存本次发芽巡检失败' `
             $_
     }
 }
@@ -4606,6 +5493,42 @@ $gSaveExistingCoords.Add_Click({
         Save-ExistingCoordinateEdits
     })
 
+# 新增发芽数变化时，自动提示需要填写几个测定样本坐标
+$gNewCount.Add_TextChanged({
+
+        Update-GerminationCoordinateHint
+    })
+
+
+# 新增数按 Enter：
+# 需要坐标时跳到坐标框；
+# 不需要坐标时直接保存。
+$gNewCount.Add_KeyDown({
+
+        param($sender, $e)
+
+        if (
+            $e.KeyCode -eq
+            [Windows.Forms.Keys]::Enter
+        ) {
+
+            $e.SuppressKeyPress = $true
+            $e.Handled = $true
+
+            Update-GerminationCoordinateHint
+
+
+            if ($gNewCoords.Enabled) {
+
+                $gNewCoords.Focus()
+                $gNewCoords.SelectAll()
+            }
+            else {
+
+                Record-NewGerminations
+            }
+        }
+    })
 
 # 记录今天新发芽
 $gRecordToday.Add_Click({
