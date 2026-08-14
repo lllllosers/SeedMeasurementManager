@@ -1,0 +1,38 @@
+# ============================================================
+# Seed Measurement Manager
+# ============================================================
+
+# ---------- Runtime files ----------
+last_workbook.txt
+error.log
+startup_perf.log
+
+# ---------- Excel temporary files ----------
+~$*.xlsx
+~$*.xlsm
+~$*.xls
+*.tmp
+
+# ---------- Experimental data ----------
+data/*
+!data/README_实验数据目录.txt
+
+# ---------- User experimental workbooks ----------
+种子发芽试验结果统计-*.xlsx
+种子发芽试验结果统计-*.xlsm
+
+# ---------- Windows ----------
+Thumbs.db
+Desktop.ini
+*.lnk
+
+# ---------- Editor ----------
+.vscode/
+.idea/
+
+# ---------- Build output ----------
+草种测定管理.exe
+*.pdb
+
+# ---------- Release packages ----------
+*.zip
