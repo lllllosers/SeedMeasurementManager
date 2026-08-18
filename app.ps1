@@ -3622,7 +3622,7 @@ $gNewCoordHint.Text =
 
 $gNewCoordHint.Location =
 New-Object Drawing.Point(
-    370,
+    375,
     173
 )
 
