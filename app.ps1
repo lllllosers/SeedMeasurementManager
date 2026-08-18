@@ -3320,7 +3320,7 @@ if (Test-Path -LiteralPath $AppIconPath) {
         Write-Log ('加载应用图标失败：' + $_.Exception.Message)
     }
 }
-$form.Text = '草种测定管理 v0.7.0'
+$form.Text = '草种测定管理 v0.8.0'
 $form.StartPosition = 'CenterScreen'
 $form.Size = New-Object System.Drawing.Size(1380, 840)
 $form.MinimumSize = New-Object System.Drawing.Size(1100, 700)
