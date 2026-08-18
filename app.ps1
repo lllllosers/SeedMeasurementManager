@@ -1,21 +1,26 @@
 ﻿#requires -Version 5.1
 # =============================================================================
-# 草种测定管理 v0.7.0
+# 草种测定管理 v0.8.0
 # -----------------------------------------------------------------------------
 # 当前稳定功能：
 #   1. Excel 后台连接：隐藏 Excel COM、缓存加速、保存落盘、退出释放
 #   2. 今日任务：统计、搜索、DAG 筛选、双击跳转到根苗长录入
 #   3. 发芽巡检：培养皿级新增发芽记录、累计发芽率、置床日期与巡检历史
 #   4. 测定样本：前10个发芽样本自动进入根/苗长流程，原始坐标可选记录
-#   5. 根苗长录入：3/7/14DAG 连续录入、Enter 流转、保存并下一条
-#   6. 数据安全：输入校验、累计越界保护、已有测定值防覆盖、保存校验
+#   5. 根苗长录入：3/7/14DAG 连续录入、物种历史实时核对、保存并下一条
+#   6. 数据纠错：已有根苗长修改、阶段数据清除、误操作保护与任务恢复
+#   7. 数据安全：输入校验、累计越界保护、保存校验、Excel 后台持久化
 #
-# 本版变更（v0.7.0）：
-#   - 新增培养皿级“发芽记录”和实时发芽率管理。
-#   - 新增“试验设置”，支持总种子数、取样数、重复等实验参数。
-#   - 发芽率巡检与前10个根苗长测定样本解耦。
-#   - 原始坐标改为可选信息，可即时填写或后续补录。
-#   - 支持0新增巡检、同日多次巡检以及0新增并下一物种。
+# 本版变更（v0.8.0）：
+#   - 根苗长录入页新增当前物种完整测定历史，集中显示发芽日期与3/7/14DAG根苗长。
+#   - 支持样本ID、物种编号、物种名称及唯一部分名称查询。
+#   - 无今日任务的物种仍可进入历史查看模式。
+#   - 当前样本、当前DAG及输入交叉位置提供分层高亮，便于实时核对。
+#   - 双击已有根苗长数据可进入历史修改模式，并同时核对该DAG根长和苗长。
+#   - 支持确认修改、Esc取消、Enter确认以及纠错目标直接切换。
+#   - 支持清除整个DAG的根苗长数据，并重新计算测定计划。
+#   - 修改或清除完成后自动恢复原实验任务或原历史查看上下文。
+#   - 根苗长历史纳入内存缓存，减少Excel COM逐单元格读取。
 #
 # 依赖：
 #   - Windows PowerShell 5.1
@@ -327,6 +332,26 @@ $script:SelectedGerminationSpeciesId = ''
 # 清除搜索条件时，避免 TextChanged / SelectedIndexChanged 重复刷新
 $script:IgnoreTaskFilterEvents = $false
 
+$script:MeasurementEditMode = $false
+
+# 当前是否是“按物种查询历史、但该物种没有今日任务”的查看状态
+$script:MeasurementQueryHistoryOnly = $false
+
+# 如果从纯历史查看状态进入纠错，
+# 修改结束后回到原物种历史，而不是跳到其他今日任务。
+$script:MeasurementReturnHistorySpeciesId = ''
+
+# 正在修改的历史样本和 DAG
+$script:MeasurementEditSampleId = ''
+$script:MeasurementEditStage = 0
+
+# 进入纠错前正在正常录入的任务。
+# 修改结束后恢复。
+$script:MeasurementReturnSampleId = ''
+
+# 原值，用于修改确认。
+$script:MeasurementOriginalRoot = $null
+$script:MeasurementOriginalShoot = $null
 
 # =============================================================================
 # 04. Excel 生命周期：连接、保存、断开
@@ -1061,7 +1086,15 @@ function Rebuild-Cache {
     $todayTasks = New-Object System.Collections.ArrayList
 
     # -------------------------------------------------------------------------
-    # 5.1 根-苗长统计表：A:F
+    # 5.1 根-苗长统计表：A:L
+    #
+    # A-F：样本基础信息
+    # G-I：3/7/14 DAG 根长
+    # J-L：3/7/14 DAG 苗长
+    #
+    # 根苗长历史统一进入 DataCache。
+    # 后续历史表展示、已有数据检查和纠错均优先读取内存，
+    # 避免切换样本时频繁通过 Excel COM 逐单元格读取。
     # -------------------------------------------------------------------------
 
     $lastCell = $null
@@ -1082,7 +1115,7 @@ function Rebuild-Cache {
         $range = $null
 
         try {
-            $range = $script:DataSheet.Range("A2:F$dataLastRow")
+            $range = $script:DataSheet.Range("A2:L$dataLastRow")
             $values = $range.Value2
         }
         finally {
@@ -1108,6 +1141,16 @@ function Rebuild-Cache {
                 SeedNo      = Safe-Text ($values.GetValue($i, 3))
                 PlacedDate  = $values.GetValue($i, 5)
                 Germination = $values.GetValue($i, 6)
+
+                # 根长
+                Root3       = $values.GetValue($i, 7)
+                Root7       = $values.GetValue($i, 8)
+                Root14      = $values.GetValue($i, 9)
+
+                # 苗长
+                Shoot3      = $values.GetValue($i, 10)
+                Shoot7      = $values.GetValue($i, 11)
+                Shoot14     = $values.GetValue($i, 12)
             }
         }
     }
@@ -1544,6 +1587,91 @@ function Get-SampleInfo([string]$SampleId) {
         Germination = ExcelDate-ToText $data.Germination
         Status      = $status
     }
+}
+
+function Get-SpeciesMeasurementHistory(
+    [string]$SpeciesId
+) {
+    if ($null -eq $script:Book) {
+        throw '尚未连接 Excel。'
+    }
+
+    $targetSpeciesId =
+    Normalize-SpeciesId $SpeciesId
+
+    if (
+        [string]::IsNullOrWhiteSpace(
+            $targetSpeciesId
+        )
+    ) {
+        throw '物种编号不能为空。'
+    }
+
+    $items =
+    New-Object System.Collections.ArrayList
+
+    foreach (
+        $entry in
+        $script:DataCache.GetEnumerator()
+    ) {
+        $sampleId =
+        [string]$entry.Key
+
+        $data =
+        $entry.Value
+
+        if (
+            $data.SpeciesId -ne
+            $targetSpeciesId
+        ) {
+            continue
+        }
+
+        [void]$items.Add(
+            [pscustomobject]@{
+                SampleId    = $sampleId
+                SpeciesId   = $data.SpeciesId
+                SpeciesName = $data.SpeciesName
+                SeedNo      = $data.SeedNo
+                Germination = ExcelDate-ToText $data.Germination
+
+                Root3       = $data.Root3
+                Shoot3      = $data.Shoot3
+
+                Root7       = $data.Root7
+                Shoot7      = $data.Shoot7
+
+                Root14      = $data.Root14
+                Shoot14     = $data.Shoot14
+            }
+        )
+    }
+
+    if ($items.Count -eq 0) {
+        throw (
+            '未找到物种编号：' +
+            $targetSpeciesId
+        )
+    }
+
+    # 种子编号通常为 1～10。
+    # 优先按数字排序；无法解析的编号放在末尾。
+    $sorted =
+    @(
+        $items |
+        Sort-Object {
+            $seedNumber = 999999
+
+            [void][int]::TryParse(
+                [string]$_.SeedNo,
+                [ref]$seedNumber
+            )
+
+            $seedNumber
+        }, SampleId
+    )
+
+    return $sorted
 }
 
 function Save-Germination([string]$SampleId, [DateTime]$DateValue) {
@@ -2715,31 +2843,132 @@ function Has-Value($Value) {
     return $true
 }
 
-function Get-ExistingMeasurement([string]$SampleId, [int]$Stage) {
-    $info = Get-SampleInfo $SampleId
-    $row = $info.DataRow
+function Test-MeasurementValueEqual(
+    $Value1,
+    $Value2
+) {
+    $has1 = Has-Value $Value1
+    $has2 = Has-Value $Value2
+
+
+    if (-not $has1 -and -not $has2) {
+        return $true
+    }
+
+    if ($has1 -ne $has2) {
+        return $false
+    }
+
+
+    $text1 =
+    (Safe-Text $Value1).ToUpperInvariant()
+
+    $text2 =
+    (Safe-Text $Value2).ToUpperInvariant()
+
+
+    # NA 属于特殊有效值。
+    if (
+        $text1 -eq 'NA' -or
+        $text2 -eq 'NA'
+    ) {
+        return ($text1 -eq $text2)
+    }
+
+
+    $number1 = 0.0
+    $number2 = 0.0
+
+
+    $ok1 =
+    [double]::TryParse(
+        $text1,
+        [Globalization.NumberStyles]::Float,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [ref]$number1
+    )
+
+    if (-not $ok1) {
+
+        $ok1 =
+        [double]::TryParse(
+            $text1,
+            [ref]$number1
+        )
+    }
+
+
+    $ok2 =
+    [double]::TryParse(
+        $text2,
+        [Globalization.NumberStyles]::Float,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [ref]$number2
+    )
+
+    if (-not $ok2) {
+
+        $ok2 =
+        [double]::TryParse(
+            $text2,
+            [ref]$number2
+        )
+    }
+
+
+    if ($ok1 -and $ok2) {
+
+        return (
+            [Math]::Abs(
+                $number1 - $number2
+            ) -lt 0.0000001
+        )
+    }
+
+
+    return ($text1 -eq $text2)
+}
+
+function Get-ExistingMeasurement(
+    [string]$SampleId,
+    [int]$Stage
+) {
+    if ($null -eq $script:Book) {
+        throw '尚未连接 Excel。'
+    }
+
+    $target = $SampleId.Trim()
+
+    if (-not $script:DataCache.ContainsKey($target)) {
+        throw "未找到样本ID：$target"
+    }
+
+    $data = $script:DataCache[$target]
 
     switch ($Stage) {
         3 {
-            $rootCol = 7
-            $shootCol = 10
+            $root = $data.Root3
+            $shoot = $data.Shoot3
         }
+
         7 {
-            $rootCol = 8
-            $shootCol = 11
+            $root = $data.Root7
+            $shoot = $data.Shoot7
         }
+
         14 {
-            $rootCol = 9
-            $shootCol = 12
+            $root = $data.Root14
+            $shoot = $data.Shoot14
         }
+
         default {
             throw "不支持的测定阶段：$Stage"
         }
     }
 
     return [pscustomobject]@{
-        Root  = Get-CellValue $script:DataSheet $row $rootCol
-        Shoot = Get-CellValue $script:DataSheet $row $shootCol
+        Root  = $root
+        Shoot = $shoot
     }
 }
 
@@ -2789,6 +3018,185 @@ function Save-Measurement(
     Write-Log '保存根苗长完成'
 }
 
+function Update-ExistingMeasurement(
+    [string]$SampleId,
+    [int]$Stage,
+    [string]$RootText,
+    [string]$ShootText
+) {
+
+    if ($null -eq $script:Book) {
+        throw '尚未连接 Excel。'
+    }
+
+    $existing =
+    Get-ExistingMeasurement `
+        $SampleId `
+        $Stage
+
+    if (
+        -not (Has-Value $existing.Root) -and
+        -not (Has-Value $existing.Shoot)
+    ) {
+        throw (
+            "$SampleId 的 ${Stage}DAG " +
+            '当前没有已有测定数据，不能进入历史修改。'
+        )
+    }
+
+    # 仍然沿用统一的输入合法性规则。
+    $root =
+    Parse-Measure $RootText
+
+    $shoot =
+    Parse-Measure $ShootText
+
+    $info =
+    Get-SampleInfo $SampleId
+
+
+    switch ($Stage) {
+
+        3 {
+            $rootCol = 7
+            $shootCol = 10
+        }
+
+        7 {
+            $rootCol = 8
+            $shootCol = 11
+        }
+
+        14 {
+            $rootCol = 9
+            $shootCol = 12
+        }
+
+        default {
+            throw (
+                '测定阶段只能是 3、7 或 14 DAG。'
+            )
+        }
+    }
+
+
+    Set-CellValue `
+        $script:DataSheet `
+    ([int]$info.DataRow) `
+        $rootCol `
+        $root
+
+    Set-CellValue `
+        $script:DataSheet `
+    ([int]$info.DataRow) `
+        $shootCol `
+        $shoot
+
+
+    $script:PlanSheet.Calculate()
+
+    $script:Book.Save()
+
+
+    if (-not $script:Book.Saved) {
+
+        throw (
+            '修改后的根苗长数据没有成功保存到 Excel。'
+        )
+    }
+
+
+    Rebuild-Cache
+}
+
+function Clear-ExistingMeasurement(
+    [string]$SampleId,
+    [int]$Stage
+) {
+
+    if ($null -eq $script:Book) {
+        throw '尚未连接 Excel。'
+    }
+
+
+    $existing =
+    Get-ExistingMeasurement `
+        $SampleId `
+        $Stage
+
+
+    if (
+        -not (Has-Value $existing.Root) -and
+        -not (Has-Value $existing.Shoot)
+    ) {
+
+        throw (
+            "$SampleId 的 ${Stage}DAG " +
+            '当前没有可以清除的数据。'
+        )
+    }
+
+
+    $info =
+    Get-SampleInfo $SampleId
+
+
+    switch ($Stage) {
+
+        3 {
+            $rootCol = 7
+            $shootCol = 10
+        }
+
+        7 {
+            $rootCol = 8
+            $shootCol = 11
+        }
+
+        14 {
+            $rootCol = 9
+            $shootCol = 12
+        }
+
+        default {
+            throw (
+                '测定阶段只能是 3、7 或 14 DAG。'
+            )
+        }
+    }
+
+
+    # null → ClearContents()
+    Set-CellValue `
+        $script:DataSheet `
+    ([int]$info.DataRow) `
+        $rootCol `
+        $null
+
+    Set-CellValue `
+        $script:DataSheet `
+    ([int]$info.DataRow) `
+        $shootCol `
+        $null
+
+
+    # 清除以后计划表必须重新计算，
+    # 使该阶段恢复为尚未完成状态。
+    $script:PlanSheet.Calculate()
+
+    $script:Book.Save()
+
+
+    if (-not $script:Book.Saved) {
+
+        throw (
+            '清除后的工作簿没有成功保存。'
+        )
+    }
+
+
+    Rebuild-Cache
+}
 
 # =============================================================================
 # 07. UI主题与通用样式
@@ -3821,95 +4229,148 @@ $tabM.Text = '根苗长录入'
 $tabM.BackColor = $script:UiPalette.MainBg
 $tabs.TabPages.Add($tabM)
 
+
 # -----------------------------------------------------------------------------
-# 11.1 样本定位
+# 11.1 主区域：左侧录入 + 右侧当前物种历史
 # -----------------------------------------------------------------------------
+
+$mSplit = New-Object Windows.Forms.SplitContainer
+$mSplit.Dock = 'Fill'
+$mSplit.Orientation = [Windows.Forms.Orientation]::Vertical
+$mSplit.SplitterWidth = 8
+$mSplit.BackColor = $script:UiPalette.MainBg
+
+# 与发芽巡检页面相同：
+# 初始布局阶段不设置过大的 MinSize，避免 WinForms 初始化尺寸不足时报错。
+$mSplit.Panel1MinSize = 100
+$mSplit.Panel2MinSize = 100
+
+$tabM.Controls.Add($mSplit)
+
+
+# =============================================================================
+# 左侧：正常根苗长录入
+# =============================================================================
+
+$mInputPanel = New-Object Windows.Forms.Panel
+$mInputPanel.Dock = 'Fill'
+$mInputPanel.BackColor = $script:UiPalette.MainBg
+$mInputPanel.AutoScroll = $true
+$mSplit.Panel1.Controls.Add($mInputPanel)
+
+
+# -----------------------------------------------------------------------------
+# 11.2 样本定位
+# -----------------------------------------------------------------------------
+
 $mL1 = New-Object Windows.Forms.Label
-$mL1.Text = '样本ID'
-$mL1.Location = New-Object Drawing.Point(40, 40)
+$mL1.Text = '样本/物种'
+$mL1.Location = New-Object Drawing.Point(25, 35)
 $mL1.AutoSize = $true
 $mL1.ForeColor = $script:UiPalette.TextSecondary
-$tabM.Controls.Add($mL1)
+$mInputPanel.Controls.Add($mL1)
 
 $mSid = New-Object Windows.Forms.TextBox
-$mSid.Location = New-Object Drawing.Point(130, 34)
-$mSid.Size = New-Object Drawing.Size(240, 35)
+$mSid.Location = New-Object Drawing.Point(105, 29)
+$mSid.Size = New-Object Drawing.Size(205, 35)
 $mSid.Font = New-Object Drawing.Font(
     'Microsoft YaHei UI',
     13,
     [Drawing.FontStyle]::Bold
 )
-$tabM.Controls.Add($mSid)
+$mInputPanel.Controls.Add($mSid)
 
 $mFind = New-Object Windows.Forms.Button
 $mFind.Text = '查询'
-$mFind.Location = New-Object Drawing.Point(390, 33)
-$mFind.Size = New-Object Drawing.Size(85, 36)
-$tabM.Controls.Add($mFind)
+$mFind.Location = New-Object Drawing.Point(325, 28)
+$mFind.Size = New-Object Drawing.Size(80, 36)
+$mInputPanel.Controls.Add($mFind)
 
 Set-UiInput $mSid
 Set-UiSecondaryButton $mFind
 
+
 # -----------------------------------------------------------------------------
-# 11.2 当前样本信息卡
+# 11.3 当前样本信息卡
 # -----------------------------------------------------------------------------
+
 $mCard = New-Object Windows.Forms.Panel
-$mCard.Location = New-Object Drawing.Point(40, 95)
-$mCard.Size = New-Object Drawing.Size(800, 105)
+$mCard.Location = New-Object Drawing.Point(25, 90)
+$mCard.Size = New-Object Drawing.Size(380, 110)
 $mCard.BackColor = $script:UiPalette.Surface
 $mCard.BorderStyle = 'FixedSingle'
-$tabM.Controls.Add($mCard)
+$mInputPanel.Controls.Add($mCard)
 
 $mCardSid = New-Object Windows.Forms.Label
 $mCardSid.Text = '—'
-$mCardSid.Location = New-Object Drawing.Point(20, 15)
+$mCardSid.Location = New-Object Drawing.Point(18, 14)
 $mCardSid.AutoSize = $true
-$mCardSid.Font = New-Object Drawing.Font('Microsoft YaHei UI', 22, [Drawing.FontStyle]::Bold)
+$mCardSid.Font = New-Object Drawing.Font(
+    'Microsoft YaHei UI',
+    22,
+    [Drawing.FontStyle]::Bold
+)
 $mCardSid.ForeColor = $script:UiPalette.TextPrimary
 $mCard.Controls.Add($mCardSid)
 
 $mInfo = New-Object Windows.Forms.Label
 $mInfo.Text = '请输入或选择样本'
-$mInfo.Location = New-Object Drawing.Point(22, 58)
-$mInfo.Size = New-Object Drawing.Size(750, 30)
-$mInfo.Font = $script:UiFont.Input
+$mInfo.Location = New-Object Drawing.Point(20, 60)
+$mInfo.Size = New-Object Drawing.Size(345, 48)
+$mInfo.Font = $script:UiFont.Body
 $mInfo.ForeColor = $script:UiPalette.TextSecondary
+$mInfo.AutoEllipsis = $true
 $mCard.Controls.Add($mInfo)
 
+
 # -----------------------------------------------------------------------------
-# 11.3 测定参数与根/苗长输入
+# 11.4 测定参数
 # -----------------------------------------------------------------------------
+
 $mL3 = New-Object Windows.Forms.Label
 $mL3.Text = '测定阶段'
-$mL3.Location = New-Object Drawing.Point(40, 230)
+$mL3.Location = New-Object Drawing.Point(25, 235)
 $mL3.AutoSize = $true
-$mL3.ForeColor = $script:UiPalette.TextSecondary
-$tabM.Controls.Add($mL3)
+$mL3.ForeColor = $script:UiPalette.TextPrimary
+$mL3.Font = $script:UiFont.BodyBold
+$mInputPanel.Controls.Add($mL3)
 
 $mStage = New-Object Windows.Forms.ComboBox
 $mStage.DropDownStyle = 'DropDownList'
-[void]$mStage.Items.AddRange(@('3DAG', '7DAG', '14DAG'))
+[void]$mStage.Items.AddRange(
+    @(
+        '3DAG',
+        '7DAG',
+        '14DAG'
+    )
+)
 $mStage.SelectedIndex = 0
-$mStage.Location = New-Object Drawing.Point(150, 224)
-$mStage.Size = New-Object Drawing.Size(180, 35)
+$mStage.Location = New-Object Drawing.Point(130, 228)
+$mStage.Size = New-Object Drawing.Size(175, 35)
 $mStage.Font = New-Object Drawing.Font(
     'Microsoft YaHei UI',
     12,
     [Drawing.FontStyle]::Bold
 )
-$tabM.Controls.Add($mStage)
+$mInputPanel.Controls.Add($mStage)
+
 Set-UiInput $mStage
 
-# 根长
+
+# -----------------------------------------------------------------------------
+# 11.5 根长 / 苗长
+# -----------------------------------------------------------------------------
+
 $mL4 = New-Object Windows.Forms.Label
 $mL4.Text = '根长（mm）'
-$mL4.Location = New-Object Drawing.Point(40, 300)
+$mL4.Location = New-Object Drawing.Point(25, 305)
 $mL4.AutoSize = $true
-$mL4.ForeColor = $script:UiPalette.TextSecondary
-$tabM.Controls.Add($mL4)
+$mL4.ForeColor = $script:UiPalette.TextPrimary
+$mL4.Font = $script:UiFont.BodyBold
+$mInputPanel.Controls.Add($mL4)
 
 $mRoot = New-Object Windows.Forms.TextBox
-$mRoot.Location = New-Object Drawing.Point(150, 288)
+$mRoot.Location = New-Object Drawing.Point(130, 292)
 $mRoot.Size = New-Object Drawing.Size(220, 45)
 $mRoot.Font = New-Object Drawing.Font(
     'Microsoft YaHei UI',
@@ -3919,18 +4380,19 @@ $mRoot.Font = New-Object Drawing.Font(
 $mRoot.TextAlign = 'Center'
 $mRoot.BackColor = $script:UiPalette.Surface
 $mRoot.ForeColor = $script:UiPalette.TextPrimary
-$tabM.Controls.Add($mRoot)
+$mInputPanel.Controls.Add($mRoot)
 
-# 苗长
+
 $mL5 = New-Object Windows.Forms.Label
 $mL5.Text = '苗长（mm）'
-$mL5.Location = New-Object Drawing.Point(40, 365)
+$mL5.Location = New-Object Drawing.Point(25, 375)
 $mL5.AutoSize = $true
-$mL5.ForeColor = $script:UiPalette.TextSecondary
-$tabM.Controls.Add($mL5)
+$mL5.ForeColor = $script:UiPalette.TextPrimary
+$mL5.Font = $script:UiFont.BodyBold
+$mInputPanel.Controls.Add($mL5)
 
 $mShoot = New-Object Windows.Forms.TextBox
-$mShoot.Location = New-Object Drawing.Point(150, 353)
+$mShoot.Location = New-Object Drawing.Point(130, 362)
 $mShoot.Size = New-Object Drawing.Size(220, 45)
 $mShoot.Font = New-Object Drawing.Font(
     'Microsoft YaHei UI',
@@ -3940,44 +4402,669 @@ $mShoot.Font = New-Object Drawing.Font(
 $mShoot.TextAlign = 'Center'
 $mShoot.BackColor = $script:UiPalette.Surface
 $mShoot.ForeColor = $script:UiPalette.TextPrimary
-$tabM.Controls.Add($mShoot)
+$mInputPanel.Controls.Add($mShoot)
+
 
 # -----------------------------------------------------------------------------
-# 11.4 保存操作与状态提示
+# 11.6 保存操作
 # -----------------------------------------------------------------------------
+
 $mSave = New-Object Windows.Forms.Button
 $mSave.Text = '保存'
-$mSave.Location = New-Object Drawing.Point(150, 435)
-$mSave.Size = New-Object Drawing.Size(120, 44)
-$tabM.Controls.Add($mSave)
+$mSave.Location = New-Object Drawing.Point(70, 445)
+$mSave.Size = New-Object Drawing.Size(105, 44)
+$mInputPanel.Controls.Add($mSave)
 
 $mSaveNext = New-Object Windows.Forms.Button
 $mSaveNext.Text = '保存并下一条 →'
-$mSaveNext.Location = New-Object Drawing.Point(290, 435)
+$mSaveNext.Location = New-Object Drawing.Point(190, 445)
 $mSaveNext.Size = New-Object Drawing.Size(170, 44)
 $mSaveNext.Font = New-Object Drawing.Font(
     'Microsoft YaHei UI',
     10,
     [Drawing.FontStyle]::Bold
 )
-$tabM.Controls.Add($mSaveNext)
+$mInputPanel.Controls.Add($mSaveNext)
 
 Set-UiSecondaryButton $mSave
 Set-UiPrimaryButton $mSaveNext
 
-# 非弹窗式保存状态
+
 $mStatus = New-Object Windows.Forms.Label
 $mStatus.Text = ''
-$mStatus.Location = New-Object Drawing.Point(150, 505)
-$mStatus.Size = New-Object Drawing.Size(700, 35)
+$mStatus.Location = New-Object Drawing.Point(25, 515)
+$mStatus.Size = New-Object Drawing.Size(380, 60)
 $mStatus.Font = New-Object Drawing.Font(
     'Microsoft YaHei UI',
-    11,
+    10.5,
     [Drawing.FontStyle]::Bold
 )
 $mStatus.ForeColor = $script:UiPalette.TextSecondary
-$tabM.Controls.Add($mStatus)
+$mInputPanel.Controls.Add($mStatus)
 
+
+
+# =============================================================================
+# 右侧：当前物种历史
+# =============================================================================
+
+$mHistoryLayout = New-Object Windows.Forms.TableLayoutPanel
+$mHistoryLayout.Dock = 'Fill'
+$mHistoryLayout.Margin = New-Object Windows.Forms.Padding(0)
+$mHistoryLayout.Padding = New-Object Windows.Forms.Padding(12)
+$mHistoryLayout.RowCount = 4
+$mHistoryLayout.ColumnCount = 1
+$mHistoryLayout.BackColor = $script:UiPalette.MainBg
+$mSplit.Panel2.Controls.Add($mHistoryLayout)
+
+# 标题
+$mHistoryTitleRow = New-Object Windows.Forms.RowStyle
+$mHistoryTitleRow.SizeType = [Windows.Forms.SizeType]::Absolute
+$mHistoryTitleRow.Height = 55
+[void]$mHistoryLayout.RowStyles.Add($mHistoryTitleRow)
+
+# DAG 一级分组表头
+$mHistoryDagRow = New-Object Windows.Forms.RowStyle
+$mHistoryDagRow.SizeType = [Windows.Forms.SizeType]::Absolute
+$mHistoryDagRow.Height = 36
+[void]$mHistoryLayout.RowStyles.Add($mHistoryDagRow)
+
+# 历史表
+$mHistoryGridRow = New-Object Windows.Forms.RowStyle
+$mHistoryGridRow.SizeType = [Windows.Forms.SizeType]::Percent
+$mHistoryGridRow.Height = 100
+[void]$mHistoryLayout.RowStyles.Add($mHistoryGridRow)
+
+# 底部提示
+$mHistoryHintRow = New-Object Windows.Forms.RowStyle
+$mHistoryHintRow.SizeType = [Windows.Forms.SizeType]::Absolute
+$mHistoryHintRow.Height = 42
+[void]$mHistoryLayout.RowStyles.Add($mHistoryHintRow)
+
+
+# -----------------------------------------------------------------------------
+# 历史标题
+# -----------------------------------------------------------------------------
+
+$mHistoryTitlePanel = New-Object Windows.Forms.Panel
+$mHistoryTitlePanel.Dock = 'Fill'
+$mHistoryTitlePanel.BackColor = $script:UiPalette.Surface
+$mHistoryTitlePanel.BorderStyle = [Windows.Forms.BorderStyle]::FixedSingle
+$mHistoryLayout.Controls.Add(
+    $mHistoryTitlePanel,
+    0,
+    0
+)
+
+$mHistoryTitleBar =
+New-Object Windows.Forms.TableLayoutPanel
+
+$mHistoryTitleBar.Dock =
+'Fill'
+
+$mHistoryTitleBar.Margin =
+New-Object Windows.Forms.Padding(0)
+
+$mHistoryTitleBar.Padding =
+New-Object Windows.Forms.Padding(0)
+
+$mHistoryTitleBar.RowCount =
+1
+
+$mHistoryTitleBar.ColumnCount =
+3
+
+$mHistoryTitleBar.BackColor =
+$script:UiPalette.Surface
+
+$mHistoryTitlePanel.Controls.Add(
+    $mHistoryTitleBar
+)
+
+
+# 左右各留相同宽度，
+# 保证中间物种标题真正居中。
+$leftStyle =
+New-Object Windows.Forms.ColumnStyle
+
+$leftStyle.SizeType =
+[Windows.Forms.SizeType]::Absolute
+
+$leftStyle.Width =
+130
+
+[void]$mHistoryTitleBar.ColumnStyles.Add(
+    $leftStyle
+)
+
+
+$centerStyle =
+New-Object Windows.Forms.ColumnStyle
+
+$centerStyle.SizeType =
+[Windows.Forms.SizeType]::Percent
+
+$centerStyle.Width =
+100
+
+[void]$mHistoryTitleBar.ColumnStyles.Add(
+    $centerStyle
+)
+
+
+$rightStyle =
+New-Object Windows.Forms.ColumnStyle
+
+$rightStyle.SizeType =
+[Windows.Forms.SizeType]::Absolute
+
+$rightStyle.Width =
+130
+
+[void]$mHistoryTitleBar.ColumnStyles.Add(
+    $rightStyle
+)
+
+
+# 左侧留空，保持视觉对称。
+$mHistoryTitleSpacer =
+New-Object Windows.Forms.Label
+
+$mHistoryTitleSpacer.Dock =
+'Fill'
+
+$mHistoryTitleBar.Controls.Add(
+    $mHistoryTitleSpacer,
+    0,
+    0
+)
+
+
+$mHistoryTitle =
+New-Object Windows.Forms.Label
+
+$mHistoryTitle.Text =
+'当前物种测定历史'
+
+$mHistoryTitle.Dock =
+'Fill'
+
+$mHistoryTitle.TextAlign =
+[Drawing.ContentAlignment]::MiddleCenter
+
+$mHistoryTitle.Font =
+New-Object Drawing.Font(
+    'Microsoft YaHei UI',
+    13,
+    [Drawing.FontStyle]::Bold
+)
+
+$mHistoryTitle.ForeColor =
+$script:UiPalette.TextPrimary
+
+$mHistoryTitleBar.Controls.Add(
+    $mHistoryTitle,
+    1,
+    0
+)
+
+
+$mHistoryUnit =
+New-Object Windows.Forms.Label
+
+$mHistoryUnit.Text =
+'单位：mm'
+
+$mHistoryUnit.Dock =
+'Fill'
+
+$mHistoryUnit.TextAlign =
+[Drawing.ContentAlignment]::MiddleRight
+
+$mHistoryUnit.Padding =
+New-Object Windows.Forms.Padding(
+    0,
+    0,
+    14,
+    0
+)
+
+$mHistoryUnit.Font =
+$script:UiFont.BodyBold
+
+$mHistoryUnit.ForeColor =
+$script:UiPalette.TextPrimary
+
+$mHistoryTitleBar.Controls.Add(
+    $mHistoryUnit,
+    2,
+    0
+)
+
+
+# -----------------------------------------------------------------------------
+# 方案 A：DAG 一级分组表头
+#
+# 下方 DataGridView 自己显示第二级：
+# 种子编号 | 发芽日期 | 根长 | 苗长 | 根长 | 苗长 | 根长 | 苗长
+#
+# 本层显示：
+#                     3 DAG        7 DAG        14 DAG
+# -----------------------------------------------------------------------------
+
+$mDagHeader = New-Object Windows.Forms.TableLayoutPanel
+$mDagHeader.Dock = 'Fill'
+$mDagHeader.Margin = New-Object Windows.Forms.Padding(0)
+$mDagHeader.Padding = New-Object Windows.Forms.Padding(0)
+$mDagHeader.RowCount = 1
+$mDagHeader.ColumnCount = 8
+$mDagHeader.BackColor = $script:UiPalette.GridHeader
+$mHistoryLayout.Controls.Add(
+    $mDagHeader,
+    0,
+    1
+)
+
+# 必须与下方 DataGridView 列宽保持一致。
+# 前两列固定宽度；
+# 六个根/苗测定列平均使用剩余空间。
+$mDagFixedWidths = @(
+    95,
+    125
+)
+
+foreach ($width in $mDagFixedWidths) {
+
+    $style =
+    New-Object Windows.Forms.ColumnStyle
+
+    $style.SizeType =
+    [Windows.Forms.SizeType]::Absolute
+
+    $style.Width =
+    $width
+
+    [void]$mDagHeader.ColumnStyles.Add(
+        $style
+    )
+}
+
+for ($i = 0; $i -lt 6; $i++) {
+
+    $style =
+    New-Object Windows.Forms.ColumnStyle
+
+    $style.SizeType =
+    [Windows.Forms.SizeType]::Percent
+
+    $style.Width =
+    (100 / 6)
+
+    [void]$mDagHeader.ColumnStyles.Add(
+        $style
+    )
+}
+
+# 左侧两个占位，与下方“种子编号 / 发芽日期”对齐。
+$mDagSpacer1 = New-Object Windows.Forms.Label
+$mDagSpacer1.Dock = 'Fill'
+$mDagSpacer1.BackColor = $script:UiPalette.GridHeader
+$mDagHeader.Controls.Add(
+    $mDagSpacer1,
+    0,
+    0
+)
+
+$mDagSpacer2 = New-Object Windows.Forms.Label
+$mDagSpacer2.Dock = 'Fill'
+$mDagSpacer2.BackColor = $script:UiPalette.GridHeader
+$mDagHeader.Controls.Add(
+    $mDagSpacer2,
+    1,
+    0
+)
+
+
+function New-DagGroupLabel(
+    [string]$Text
+) {
+    $label = New-Object Windows.Forms.Label
+    $label.Text = $Text
+    $label.Dock = 'Fill'
+    $label.TextAlign =
+    [Drawing.ContentAlignment]::MiddleCenter
+    $label.Font = $script:UiFont.BodyBold
+    $label.ForeColor = $script:UiPalette.TextPrimary
+    $label.BackColor = $script:UiPalette.GridHeader
+    $label.Margin = New-Object Windows.Forms.Padding(0)
+
+    return $label
+}
+
+
+$mDag3Label = New-DagGroupLabel '3 DAG'
+$mDagHeader.Controls.Add(
+    $mDag3Label,
+    2,
+    0
+)
+$mDagHeader.SetColumnSpan(
+    $mDag3Label,
+    2
+)
+
+$mDag7Label = New-DagGroupLabel '7 DAG'
+$mDagHeader.Controls.Add(
+    $mDag7Label,
+    4,
+    0
+)
+$mDagHeader.SetColumnSpan(
+    $mDag7Label,
+    2
+)
+
+$mDag14Label = New-DagGroupLabel '14 DAG'
+$mDagHeader.Controls.Add(
+    $mDag14Label,
+    6,
+    0
+)
+$mDagHeader.SetColumnSpan(
+    $mDag14Label,
+    2
+)
+
+
+# -----------------------------------------------------------------------------
+# 历史 DataGridView
+# -----------------------------------------------------------------------------
+
+$mHistoryGrid = New-Object Windows.Forms.DataGridView
+$mHistoryGrid.Dock = 'Fill'
+$mHistoryGrid.Margin = New-Object Windows.Forms.Padding(0)
+$mHistoryGrid.ReadOnly = $true
+$mHistoryGrid.AllowUserToAddRows = $false
+$mHistoryGrid.AllowUserToDeleteRows = $false
+$mHistoryGrid.AllowUserToResizeRows = $false
+$mHistoryGrid.AllowUserToOrderColumns = $false
+$mHistoryGrid.MultiSelect = $false
+$mHistoryGrid.RowHeadersVisible = $false
+$mHistoryGrid.SelectionMode =
+[Windows.Forms.DataGridViewSelectionMode]::CellSelect
+$mHistoryGrid.AutoSizeColumnsMode =
+[Windows.Forms.DataGridViewAutoSizeColumnsMode]::None
+$mHistoryGrid.ScrollBars =
+[Windows.Forms.ScrollBars]::Both
+$mHistoryGrid.RowTemplate.Height = 36
+$mHistoryGrid.ColumnHeadersHeight = 40
+$mHistoryGrid.ColumnHeadersHeightSizeMode =
+[Windows.Forms.DataGridViewColumnHeadersHeightSizeMode]::DisableResizing
+$mHistoryGrid.BackgroundColor = $script:UiPalette.Surface
+$mHistoryGrid.BorderStyle =
+[Windows.Forms.BorderStyle]::FixedSingle
+
+$mHistoryLayout.Controls.Add(
+    $mHistoryGrid,
+    0,
+    2
+)
+
+
+[void]$mHistoryGrid.Columns.Add(
+    'mHistSeedNo',
+    '种子编号'
+)
+
+[void]$mHistoryGrid.Columns.Add(
+    'mHistGermination',
+    '发芽日期'
+)
+
+[void]$mHistoryGrid.Columns.Add(
+    'mHistRoot3',
+    '根长'
+)
+
+[void]$mHistoryGrid.Columns.Add(
+    'mHistShoot3',
+    '苗长'
+)
+
+[void]$mHistoryGrid.Columns.Add(
+    'mHistRoot7',
+    '根长'
+)
+
+[void]$mHistoryGrid.Columns.Add(
+    'mHistShoot7',
+    '苗长'
+)
+
+[void]$mHistoryGrid.Columns.Add(
+    'mHistRoot14',
+    '根长'
+)
+
+[void]$mHistoryGrid.Columns.Add(
+    'mHistShoot14',
+    '苗长'
+)
+
+
+$mHistoryGrid.Columns[
+'mHistSeedNo'
+].Width = 95
+
+$mHistoryGrid.Columns[
+'mHistGermination'
+].Width = 125
+
+
+foreach (
+    $columnName in
+    @(
+        'mHistRoot3',
+        'mHistShoot3',
+        'mHistRoot7',
+        'mHistShoot7',
+        'mHistRoot14',
+        'mHistShoot14'
+    )
+) {
+
+    $mHistoryGrid.Columns[
+    $columnName
+    ].AutoSizeMode =
+    [Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill
+
+    $mHistoryGrid.Columns[
+    $columnName
+    ].FillWeight =
+    100
+}
+
+
+foreach (
+    $columnName in
+    @(
+        'mHistSeedNo',
+        'mHistGermination',
+        'mHistRoot3',
+        'mHistShoot3',
+        'mHistRoot7',
+        'mHistShoot7',
+        'mHistRoot14',
+        'mHistShoot14'
+    )
+) {
+    $mHistoryGrid.Columns[
+    $columnName
+    ].DefaultCellStyle.Alignment =
+    [Windows.Forms.DataGridViewContentAlignment]::MiddleCenter
+}
+
+
+Set-UiGrid $mHistoryGrid
+
+
+# -----------------------------------------------------------------------------
+# 底部提示
+# -----------------------------------------------------------------------------
+
+$mHistoryHint = New-Object Windows.Forms.Label
+$mHistoryHint.Text = '双击已有测定值可修改；空白测定值请通过正常测定流程录入'
+$mHistoryHint.Dock = 'Fill'
+$mHistoryHint.TextAlign =
+[Drawing.ContentAlignment]::MiddleLeft
+$mHistoryHint.Padding =
+New-Object Windows.Forms.Padding(
+    8,
+    0,
+    0,
+    0
+)
+$mHistoryHint.Font = $script:UiFont.Small
+$mHistoryHint.ForeColor = $script:UiPalette.TextSecondary
+$mHistoryLayout.Controls.Add(
+    $mHistoryHint,
+    0,
+    3
+)
+
+# -----------------------------------------------------------------------------
+# 历史纠错模式提示
+# -----------------------------------------------------------------------------
+
+$mEditBanner = New-Object Windows.Forms.Panel
+$mEditBanner.Location =
+New-Object Drawing.Point(
+    25,
+    575
+)
+
+$mEditBanner.Size =
+New-Object Drawing.Size(
+    380,
+    105
+)
+
+$mEditBanner.BackColor =
+$script:UiPalette.WarningSoft
+
+$mEditBanner.BorderStyle =
+[Windows.Forms.BorderStyle]::FixedSingle
+
+$mEditBanner.Visible =
+$false
+
+$mInputPanel.Controls.Add(
+    $mEditBanner
+)
+
+
+$mEditText =
+New-Object Windows.Forms.Label
+
+$mEditText.Text =
+'正在修改已有测定数据'
+
+$mEditText.Location =
+New-Object Drawing.Point(
+    12,
+    8
+)
+
+$mEditText.Size =
+New-Object Drawing.Size(
+    350,
+    25
+)
+
+$mEditText.Font =
+$script:UiFont.BodyBold
+
+$mEditText.ForeColor =
+$script:UiPalette.Warning
+
+$mEditBanner.Controls.Add(
+    $mEditText
+)
+
+
+$mCancelEdit =
+New-Object Windows.Forms.Button
+
+$mCancelEdit.Text =
+'取消修改'
+
+$mCancelEdit.Location =
+New-Object Drawing.Point(
+    12,
+    50
+)
+
+$mCancelEdit.Size =
+New-Object Drawing.Size(
+    100,
+    38
+)
+
+$mEditBanner.Controls.Add(
+    $mCancelEdit
+)
+
+Set-UiSecondaryButton $mCancelEdit
+
+
+$mClearEdit =
+New-Object Windows.Forms.Button
+
+$mClearEdit.Text =
+'清除本阶段'
+
+$mClearEdit.Location =
+New-Object Drawing.Point(
+    125,
+    50
+)
+
+$mClearEdit.Size =
+New-Object Drawing.Size(
+    110,
+    38
+)
+
+$mEditBanner.Controls.Add(
+    $mClearEdit
+)
+
+Set-UiSecondaryButton $mClearEdit
+
+
+$mConfirmEdit =
+New-Object Windows.Forms.Button
+
+$mConfirmEdit.Text =
+'确认修改'
+
+$mConfirmEdit.Location =
+New-Object Drawing.Point(
+    248,
+    50
+)
+
+$mConfirmEdit.Size =
+New-Object Drawing.Size(
+    110,
+    38
+)
+
+$mEditBanner.Controls.Add(
+    $mConfirmEdit
+)
+
+Set-UiPrimaryButton $mConfirmEdit
 
 # =============================================================================
 # 12. UI 业务逻辑：今日任务
@@ -5235,21 +6322,1125 @@ function Select-NextGerminationSpecies {
 # =============================================================================
 # 连续录入流程：定位样本 -> 校验阶段/数值 -> 防覆盖 -> 保存 -> 刷新/下一条。
 
-function Lookup-M {
-    try {
-        $sid = $mSid.Text.Trim()
+function Get-MeasurementResumeSampleId {
 
-        if ([string]::IsNullOrWhiteSpace($sid)) {
+    $currentSampleId =
+    $mSid.Text.Trim()
+
+    $tasks =
+    @($script:TodayTaskCache)
+
+
+    # -------------------------------------------------------------------------
+    # 第一优先级：
+    # 当前页面上的样本本身仍然是“今日待测任务”。
+    #
+    # 例如：
+    # 当前正在测 001-2 3DAG，
+    # 此时发现 001-1 历史值有错并进入纠错。
+    #
+    # 修完后应继续回 001-2。
+    # -------------------------------------------------------------------------
+
+    if (
+        -not
+        [string]::IsNullOrWhiteSpace(
+            $currentSampleId
+        )
+    ) {
+
+        foreach ($task in $tasks) {
+
+            if (
+                $task.SampleId -eq
+                $currentSampleId
+            ) {
+
+                return $currentSampleId
+            }
+        }
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 第二优先级：
+    # 当前页面样本已经不再属于今日任务。
+    #
+    # 典型情况：
+    # 刚保存 001-1 3DAG，
+    # 页面因为 Lookup-M 又显示了 001-1 的后续状态，
+    # 但真正应该继续的任务已经是 001-2 3DAG。
+    #
+    # 此时直接恢复今日任务队列第一项。
+    # -------------------------------------------------------------------------
+
+    if ($tasks.Count -gt 0) {
+
+        return [string]$tasks[0].SampleId
+    }
+
+
+    # 今日已经没有待测任务。
+    return ''
+}
+
+function Enter-MeasurementEditMode(
+    [string]$SampleId,
+    [int]$Stage
+) {
+
+    # -------------------------------------------------------------------------
+    # 如果已经处于纠错模式：
+    # 允许直接双击另一个历史值切换目标。
+    #
+    # 如果当前输入框已经被修改，则先询问是否放弃未保存修改。
+    # -------------------------------------------------------------------------
+
+    if ($script:MeasurementEditMode) {
+
+        # 双击的就是当前正在修改的同一个 DAG，不需要重新加载。
+        if (
+            $script:MeasurementEditSampleId -eq
+            $SampleId -and
+            $script:MeasurementEditStage -eq
+            $Stage
+        ) {
             return
         }
 
-        $info = Get-SampleInfo $sid
+
+        $newRootCurrent =
+        $null
+
+        $newShootCurrent =
+        $null
+
+
+        try {
+
+            $newRootCurrent =
+            Parse-Measure $mRoot.Text
+
+            $newShootCurrent =
+            Parse-Measure $mShoot.Text
+        }
+        catch {
+            # 当前输入甚至还没有形成合法测定值，
+            # 也属于“发生了未保存编辑”。
+            $newRootCurrent =
+            $mRoot.Text
+
+            $newShootCurrent =
+            $mShoot.Text
+        }
+
+
+        $rootUnchanged =
+        Test-MeasurementValueEqual `
+            $script:MeasurementOriginalRoot `
+            $newRootCurrent
+
+        $shootUnchanged =
+        Test-MeasurementValueEqual `
+            $script:MeasurementOriginalShoot `
+            $newShootCurrent
+
+
+        if (
+            -not $rootUnchanged -or
+            -not $shootUnchanged
+        ) {
+
+            $answer =
+            [Windows.Forms.MessageBox]::Show(
+                (
+                    '当前历史修改尚未保存。' +
+                    "`r`n`r`n" +
+                    '是否放弃当前修改并切换到：' +
+                    "`r`n" +
+                    "$SampleId · ${Stage}DAG？"
+                ),
+                '切换历史修改目标',
+                [Windows.Forms.MessageBoxButtons]::YesNo,
+                [Windows.Forms.MessageBoxIcon]::Warning,
+                [Windows.Forms.MessageBoxDefaultButton]::Button2
+            )
+
+
+            if (
+                $answer -ne
+                [Windows.Forms.DialogResult]::Yes
+            ) {
+                return
+            }
+        }
+    }
+    else {
+
+        # ---------------------------------------------------------------------
+        # 第一次进入纠错：
+        # 记住纠错完成后应该回到哪里。
+        # ---------------------------------------------------------------------
+
+        if ($script:MeasurementQueryHistoryOnly) {
+
+            # 当前是某个没有今日任务的物种历史页面。
+            $script:MeasurementReturnSampleId =
+            ''
+
+            $script:MeasurementReturnHistorySpeciesId =
+            Get-SpeciesIdFromSampleId $SampleId
+        }
+        else {
+
+            # 当前是正常实验流程。
+            $script:MeasurementReturnSampleId =
+            Get-MeasurementResumeSampleId
+
+            $script:MeasurementReturnHistorySpeciesId =
+            ''
+        }
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 读取即将修改的新目标
+    # -------------------------------------------------------------------------
+
+    $existing =
+    Get-ExistingMeasurement `
+        $SampleId `
+        $Stage
+
+
+    if (
+        -not (Has-Value $existing.Root) -and
+        -not (Has-Value $existing.Shoot)
+    ) {
+
+        # 空白测定值不能通过历史表补录。
+        return
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 正式切换当前纠错目标
+    # -------------------------------------------------------------------------
+
+    $script:MeasurementEditMode =
+    $true
+
+    $script:MeasurementEditSampleId =
+    $SampleId
+
+    $script:MeasurementEditStage =
+    $Stage
+
+    $script:MeasurementOriginalRoot =
+    $existing.Root
+
+    $script:MeasurementOriginalShoot =
+    $existing.Shoot
+
+
+    $mSid.Text =
+    $SampleId
+
+    $mStage.SelectedItem =
+    "${Stage}DAG"
+
+
+    if (Has-Value $existing.Root) {
+
+        $mRoot.Text =
+        [string]$existing.Root
+    }
+    else {
+
+        $mRoot.Clear()
+    }
+
+
+    if (Has-Value $existing.Shoot) {
+
+        $mShoot.Text =
+        [string]$existing.Shoot
+    }
+    else {
+
+        $mShoot.Clear()
+    }
+
+
+    $info =
+    Get-SampleInfo $SampleId
+
+
+    $mCardSid.Text =
+    $SampleId
+
+    $mInfo.Text =
+    "$($info.SpeciesId) · $($info.SpeciesName) · " +
+    "种子 $($info.SeedNo)" +
+    "`r`n" +
+    "当前状态：历史修改"
+
+
+    # 当前样本卡进入纠错视觉状态。
+    $mCard.BackColor =
+    $script:UiPalette.WarningSoft
+
+    $mCardSid.ForeColor =
+    $script:UiPalette.Warning
+
+    $mInfo.ForeColor =
+    $script:UiPalette.Warning
+
+
+    # 定位信息锁定。
+    $mSid.Enabled =
+    $false
+
+    $mFind.Enabled =
+    $false
+
+    $mStage.Enabled =
+    $false
+
+
+    # 根苗输入必须允许编辑。
+    $mRoot.Enabled =
+    $true
+
+    $mShoot.Enabled =
+    $true
+
+
+    # 正常保存按钮禁用。
+    $mSave.Enabled =
+    $false
+
+    $mSaveNext.Enabled =
+    $false
+
+
+    $mEditText.Text =
+    "正在修改：$SampleId · ${Stage}DAG"
+
+    $mEditBanner.Visible =
+    $true
+
+
+    $mStatus.ForeColor =
+    $script:UiPalette.Warning
+
+    $mStatus.Text =
+    "历史修改模式 · $SampleId · ${Stage}DAG"
+
+
+    Refresh-MeasurementHistory `
+        $SampleId
+
+
+    $mRoot.Focus()
+    $mRoot.SelectAll()
+}
+
+function Exit-MeasurementEditMode(
+    [bool]$RestoreNormalTask = $true
+) {
+
+    $returnSampleId =
+    $script:MeasurementReturnSampleId
+
+    $returnHistorySpeciesId =
+    $script:MeasurementReturnHistorySpeciesId
+
+    $script:MeasurementEditMode =
+    $false
+
+    $script:MeasurementEditSampleId =
+    ''
+
+    $script:MeasurementEditStage =
+    0
+
+    $script:MeasurementOriginalRoot =
+    $null
+
+    $script:MeasurementOriginalShoot =
+    $null
+
+    $script:MeasurementReturnSampleId =
+    ''
+    $script:MeasurementReturnHistorySpeciesId =
+    ''
+
+    $mSid.Enabled =
+    $true
+
+    $mFind.Enabled =
+    $true
+
+    $mStage.Enabled =
+    $true
+
+    $mSave.Enabled =
+    $true
+
+    $mSaveNext.Enabled =
+    $true
+
+    $mEditBanner.Visible =
+    $false
+
+    # 恢复正常录入视觉状态。
+    $mCard.BackColor =
+    $script:UiPalette.Surface
+
+    $mCardSid.ForeColor =
+    $script:UiPalette.TextPrimary
+
+    $mL1.ForeColor =
+    $script:UiPalette.TextPrimary
+
+    $mL1.Font =
+    $script:UiFont.BodyBold
+
+
+    $mRoot.Clear()
+    $mShoot.Clear()
+
+
+    if ($RestoreNormalTask) {
+
+        $tasks =
+        @($script:TodayTaskCache)
+
+
+        # -------------------------------------------------------------
+        # 检查进入纠错前保存的恢复任务现在是否仍然待测。
+        # -------------------------------------------------------------
+
+        $resumeSampleId =
+        ''
+
+        if (
+            -not
+            [string]::IsNullOrWhiteSpace(
+                $returnSampleId
+            )
+        ) {
+
+            foreach ($task in $tasks) {
+
+                if (
+                    $task.SampleId -eq
+                    $returnSampleId
+                ) {
+
+                    $resumeSampleId =
+                    $returnSampleId
+
+                    break
+                }
+            }
+        }
+
+
+        # -------------------------------------------------------------
+        # 如果原恢复任务因为重新计算已经不存在，
+        # 则继续当前今日任务队列第一项。
+        # -------------------------------------------------------------
+
+        if (
+            [string]::IsNullOrWhiteSpace(
+                $resumeSampleId
+            ) -and
+            $tasks.Count -gt 0
+        ) {
+
+            $resumeSampleId =
+            [string]$tasks[0].SampleId
+        }
+
+
+        if (
+            -not
+            [string]::IsNullOrWhiteSpace(
+                $resumeSampleId
+            ) -and
+            $script:DataCache.ContainsKey(
+                $resumeSampleId
+            )
+        ) {
+
+            $mSid.Text =
+            $resumeSampleId
+
+            Lookup-M
+
+            return
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # 如果纠错前是纯历史查看，
+    # 修改结束后重新回到该物种历史。
+    # -------------------------------------------------------------------------
+
+    if (
+        $RestoreNormalTask -and
+        -not
+        [string]::IsNullOrWhiteSpace(
+            $returnHistorySpeciesId
+        )
+    ) {
+
+        $mSid.Enabled =
+        $true
+
+        $mFind.Enabled =
+        $true
+
+        $mStage.Enabled =
+        $true
+
+
+        $mSid.Text =
+        $returnHistorySpeciesId
+
+
+        Lookup-M
+
+        return
+    }
+
+    $mSid.Clear()
+
+    $mCardSid.Text =
+    '—'
+
+    $mInfo.Text =
+    '请输入或选择样本'
+
+    Clear-MeasurementHistory
+
+    $mSid.Focus()
+}
+
+function Clear-MeasurementHistory {
+
+    $mHistoryGrid.Rows.Clear()
+
+    $mHistoryTitle.Text =
+    '当前物种测定历史'
+
+    $mHistoryGrid.ClearSelection()
+}
+
+function Get-MeasurementHistoryStageColumns(
+    [int]$Stage
+) {
+
+    switch ($Stage) {
+
+        3 {
+            return @(
+                'mHistRoot3',
+                'mHistShoot3'
+            )
+        }
+
+        7 {
+            return @(
+                'mHistRoot7',
+                'mHistShoot7'
+            )
+        }
+
+        14 {
+            return @(
+                'mHistRoot14',
+                'mHistShoot14'
+            )
+        }
+
+        default {
+            return @()
+        }
+    }
+}
+
+
+function Apply-MeasurementHistoryHighlight {
+
+    if ($null -eq $mHistoryGrid) {
+        return
+    }
+
+    $currentSampleId =
+    $mSid.Text.Trim()
+
+    $currentStage = 0
+
+    if ($null -ne $mStage.SelectedItem) {
+
+        $stageText =
+        [string]$mStage.SelectedItem
+
+        [void][int]::TryParse(
+            $stageText.Replace(
+                'DAG',
+                ''
+            ),
+            [ref]$currentStage
+        )
+    }
+
+
+    $stageColumns =
+    @(
+        Get-MeasurementHistoryStageColumns `
+            $currentStage
+    )
+
+    # -------------------------------------------------------------------------
+    # DAG 一级表头恢复默认状态
+    # -------------------------------------------------------------------------
+
+    $mDag3Label.BackColor =
+    $script:UiPalette.GridHeader
+
+    $mDag7Label.BackColor =
+    $script:UiPalette.GridHeader
+
+    $mDag14Label.BackColor =
+    $script:UiPalette.GridHeader
+
+
+    # 当前 DAG 的一级表头同步强调。
+    switch ($currentStage) {
+
+        3 {
+            $mDag3Label.BackColor =
+            $script:UiPalette.WarningSoft
+        }
+
+        7 {
+            $mDag7Label.BackColor =
+            $script:UiPalette.WarningSoft
+        }
+
+        14 {
+            $mDag14Label.BackColor =
+            $script:UiPalette.WarningSoft
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # 1. 清除上一轮人为高亮。
+    #
+    # 空数据继续保持空白。
+    # 不主动填入任何“—”。
+    # -------------------------------------------------------------------------
+
+    foreach ($row in $mHistoryGrid.Rows) {
+
+        $row.DefaultCellStyle.BackColor =
+        [Drawing.Color]::Empty
+
+        $row.DefaultCellStyle.ForeColor =
+        $script:UiPalette.TextPrimary
+
+        foreach ($cell in $row.Cells) {
+
+            $cell.Style.BackColor =
+            [Drawing.Color]::Empty
+
+            $cell.Style.ForeColor =
+            [Drawing.Color]::Empty
+        }
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 2. 当前 DAG 两列轻度高亮。
+    # -------------------------------------------------------------------------
+
+    foreach ($columnName in $stageColumns) {
+
+        foreach ($row in $mHistoryGrid.Rows) {
+
+            $row.Cells[
+            $columnName
+            ].Style.BackColor =
+            $script:UiPalette.BlueSoft
+        }
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 3. 当前样本整行突出。
+    # -------------------------------------------------------------------------
+
+    foreach ($row in $mHistoryGrid.Rows) {
+
+        $sampleId =
+        Safe-Text $row.Tag
+
+        if ($sampleId -ne $currentSampleId) {
+            continue
+        }
+
+        $row.DefaultCellStyle.BackColor =
+        $script:UiPalette.PrimarySoft
+
+        $row.DefaultCellStyle.ForeColor =
+        $script:UiPalette.TextPrimary
+
+
+        # 当前样本 × 当前 DAG：
+        # 单独使用第三种浅色作为“输入焦点”。
+        #
+        # 行 = 当前种子
+        # 列 = 当前 DAG
+        # 交叉 = 当前真正正在录入的位置
+        foreach ($columnName in $stageColumns) {
+
+            $row.Cells[
+            $columnName
+            ].Style.BackColor =
+            $script:UiPalette.WarningSoft
+
+            $row.Cells[
+            $columnName
+            ].Style.ForeColor =
+            $script:UiPalette.TextPrimary
+        }
+
+        break
+    }
+
+
+    # 不使用系统默认蓝色选中效果干扰历史高亮。
+    $mHistoryGrid.ClearSelection()
+}
+
+
+function Refresh-MeasurementHistory(
+    [string]$SampleId
+) {
+
+    if ($null -eq $script:Book) {
+
+        Clear-MeasurementHistory
+        return
+    }
+
+
+    if (
+        [string]::IsNullOrWhiteSpace(
+            $SampleId
+        )
+    ) {
+
+        Clear-MeasurementHistory
+        return
+    }
+
+
+    if (
+        -not
+        $script:DataCache.ContainsKey(
+            $SampleId
+        )
+    ) {
+
+        Clear-MeasurementHistory
+        return
+    }
+
+
+    $current =
+    $script:DataCache[
+    $SampleId
+    ]
+
+
+    $history =
+    @(
+        Get-SpeciesMeasurementHistory `
+            $current.SpeciesId
+    )
+
+
+    $mHistoryTitle.Text =
+    "$($current.SpeciesId) · " +
+    "$($current.SpeciesName) "
+
+
+    $mHistoryGrid.SuspendLayout()
+
+    try {
+
+        $mHistoryGrid.Rows.Clear()
+
+
+        foreach ($item in $history) {
+
+            $rowIndex =
+            $mHistoryGrid.Rows.Add(
+                (Safe-Text $item.SeedNo),
+                (Safe-Text $item.Germination),
+
+                (Safe-Text $item.Root3),
+                (Safe-Text $item.Shoot3),
+
+                (Safe-Text $item.Root7),
+                (Safe-Text $item.Shoot7),
+
+                (Safe-Text $item.Root14),
+                (Safe-Text $item.Shoot14)
+            )
+
+
+            $row =
+            $mHistoryGrid.Rows[
+            $rowIndex
+            ]
+
+
+            # SampleId 不作为界面列显示，
+            # 但保存在 Tag 中供后续纠错精确定位。
+            $row.Tag =
+            [string]$item.SampleId
+        }
+    }
+    finally {
+
+        $mHistoryGrid.ResumeLayout()
+    }
+
+
+    Apply-MeasurementHistoryHighlight
+}
+
+function Resolve-MeasurementQuery(
+    [string]$Query
+) {
+    if ($null -eq $script:Book) {
+        throw '尚未连接 Excel。'
+    }
+
+    $text = Safe-Text $Query
+
+    # 每次新查询先恢复为正常查询状态。
+    $script:MeasurementQueryHistoryOnly =
+    $false
+        
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw '请输入样本ID、物种编号或物种名称。'
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 1. 样本ID精确匹配优先
+    # -------------------------------------------------------------------------
+
+    if ($script:DataCache.ContainsKey($text)) {
+        return $text
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 2. 建立物种唯一列表
+    # -------------------------------------------------------------------------
+
+    $speciesMap = @{}
+
+    foreach ($data in $script:DataCache.Values) {
+
+        $speciesId =
+        Safe-Text $data.SpeciesId
+
+        if (
+            [string]::IsNullOrWhiteSpace(
+                $speciesId
+            )
+        ) {
+            continue
+        }
+
+        if (
+            -not
+            $speciesMap.ContainsKey(
+                $speciesId
+            )
+        ) {
+
+            $speciesMap[$speciesId] =
+            [pscustomobject]@{
+                SpeciesId   =
+                $speciesId
+
+                SpeciesName =
+                Safe-Text $data.SpeciesName
+            }
+        }
+    }
+
+
+    $targetSpecies = $null
+
+
+    # -------------------------------------------------------------------------
+    # 3. 物种编号精确匹配
+    # -------------------------------------------------------------------------
+
+    $normalized =
+    Normalize-SpeciesId $text
+
+    if (
+        $speciesMap.ContainsKey(
+            $normalized
+        )
+    ) {
+
+        $targetSpecies =
+        $speciesMap[$normalized]
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 4. 物种名称精确匹配
+    # -------------------------------------------------------------------------
+
+    if ($null -eq $targetSpecies) {
+
+        $queryLower =
+        $text.ToLowerInvariant()
+
+        $exactNameMatches =
+        @(
+            $speciesMap.Values |
+            Where-Object {
+                (
+                    Safe-Text $_.SpeciesName
+                ).ToLowerInvariant() -eq
+                $queryLower
+            }
+        )
+
+
+        if ($exactNameMatches.Count -eq 1) {
+
+            $targetSpecies =
+            $exactNameMatches[0]
+        }
+        elseif ($exactNameMatches.Count -gt 1) {
+
+            throw (
+                '该物种名称对应多个物种编号，' +
+                '请改用物种编号查询。'
+            )
+        }
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 5. 物种名称部分匹配
+    # -------------------------------------------------------------------------
+
+    if ($null -eq $targetSpecies) {
+
+        $queryLower =
+        $text.ToLowerInvariant()
+
+        $partialMatches =
+        @(
+            $speciesMap.Values |
+            Where-Object {
+
+                $name =
+                (
+                    Safe-Text $_.SpeciesName
+                ).ToLowerInvariant()
+
+                -not
+                [string]::IsNullOrWhiteSpace(
+                    $name
+                ) -and
+                $name.Contains(
+                    $queryLower
+                )
+            }
+        )
+
+
+        if ($partialMatches.Count -eq 1) {
+
+            $targetSpecies =
+            $partialMatches[0]
+        }
+        elseif ($partialMatches.Count -gt 1) {
+
+            throw (
+                '查询内容匹配多个物种，' +
+                '请输入更完整的物种名称或物种编号。'
+            )
+        }
+    }
+
+
+    if ($null -eq $targetSpecies) {
+
+        throw (
+            '未找到与“' +
+            $text +
+            '”匹配的样本或物种。'
+        )
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 6. 输入物种时，定位到该物种今天最前面的待测任务
+    # -------------------------------------------------------------------------
+
+    foreach (
+        $task in
+        @($script:TodayTaskCache)
+    ) {
+
+        if (
+            $task.SpeciesId -eq
+            $targetSpecies.SpeciesId
+        ) {
+
+            return [string]$task.SampleId
+        }
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 当前物种没有今日任务：
+    # 查询仍然有效，只进入“历史查看”状态。
+    #
+    # 取该物种第一个样本作为内部定位锚点，
+    # 但界面不会把它冒充成当前待测任务。
+    # -------------------------------------------------------------------------
+
+    $history =
+    @(
+        Get-SpeciesMeasurementHistory `
+            $targetSpecies.SpeciesId
+    )
+
+
+    if ($history.Count -eq 0) {
+
+        throw (
+            '未找到物种 ' +
+            $targetSpecies.SpeciesId +
+            ' 的测定样本。'
+        )
+    }
+
+
+    $script:MeasurementQueryHistoryOnly =
+    $true
+
+
+    return [string]$history[0].SampleId
+}
+
+function Lookup-M {
+    try {
+
+        $query =
+        $mSid.Text.Trim()
+
+        if (
+            [string]::IsNullOrWhiteSpace(
+                $query
+            )
+        ) {
+            return
+        }
+
+
+        $sid =
+        Resolve-MeasurementQuery `
+            $query
+
+
+        # 按物种进行纯历史查询时，
+        # 查询框继续显示物种编号；
+        # 正常任务查询则显示实际样本ID。
+        if ($script:MeasurementQueryHistoryOnly) {
+
+            $mSid.Text =
+            (
+                Get-SampleInfo $sid
+            ).SpeciesId
+        }
+        else {
+
+            $mSid.Text =
+            $sid
+        }
+
+
+        $info =
+        Get-SampleInfo $sid
+
+        # ---------------------------------------------------------------------
+        # 仅查看历史：
+        # 当前物种没有今日待测任务，但仍允许浏览和纠错历史。
+        # ---------------------------------------------------------------------
+
+        if ($script:MeasurementQueryHistoryOnly) {
+
+            $mCardSid.Text =
+            $info.SpeciesId
+
+            $mInfo.Text =
+            "$($info.SpeciesId) · $($info.SpeciesName)" +
+            "`r`n" +
+            '当前状态：仅查看历史（今日无待测任务）'
+
+
+            $mStage.SelectedIndex =
+            -1
+
+            $mRoot.Clear()
+            $mShoot.Clear()
+
+
+            Refresh-MeasurementHistory `
+                $sid
+
+
+            $mStatus.ForeColor =
+            $script:UiPalette.TextSecondary
+
+            $mStatus.Text =
+            '当前为历史查看模式；双击右侧已有测定值可修改'
+
+
+            # 不把焦点放到测定输入框。
+            $mHistoryGrid.Focus()
+
+            return
+        }
 
         $mCardSid.Text = $sid
 
         $mInfo.Text =
         "$($info.SpeciesId) · $($info.SpeciesName) · " +
-        "种子 $($info.SeedNo) · 当前状态：$($info.Status)"
+        "种子 $($info.SeedNo)" +
+        "`r`n" +
+        "当前状态：$($info.Status)"
 
         # 每次查询先清空上一样本阶段，避免阶段“串样本”
         $mStage.SelectedIndex = -1
@@ -5264,12 +7455,18 @@ function Lookup-M {
             $mStage.SelectedItem = '3DAG'
         }
 
+        # 当前物种全部历史同步刷新。
+        Refresh-MeasurementHistory $sid
+
         $mRoot.Focus()
         $mRoot.SelectAll()
     }
     catch {
         $mCardSid.Text = '—'
         $mInfo.Text = '未找到样本'
+
+        Clear-MeasurementHistory
+
         Handle-Error '查询测定样本失败' $_
     }
 }
@@ -5390,10 +7587,19 @@ function Save-CurrentMeasurement([bool]$GoNext) {
             $mRoot.Focus()
         }
         elseif ($GoNext) {
+
             $mSid.Clear()
+
             $mCardSid.Text = '—'
-            $mInfo.Text = '今日任务已到最后一条'
-            $mStatus.Text = "✓ $sid 已保存 · 今日任务已到最后一条"
+
+            $mInfo.Text =
+            '今日任务已到最后一条'
+
+            $mStatus.Text =
+            "✓ $sid 已保存 · 今日任务已到最后一条"
+
+            Clear-MeasurementHistory
+
             $mSid.Focus()
         }
         else {
@@ -5634,6 +7840,349 @@ $gNextSpecies.Add_Click({
 # 15.4 根苗长录入：全键盘连续录入
 # -------------------------------------------------------------------------
 
+$mClearEdit.Add_Click({
+
+        try {
+
+            if (
+                -not
+                $script:MeasurementEditMode
+            ) {
+                return
+            }
+
+
+            $sampleId = $script:MeasurementEditSampleId
+
+            $stage = $script:MeasurementEditStage
+
+
+            $oldRoot =
+            '空'
+
+            $oldShoot =
+            '空'
+
+
+            if (Has-Value $script:MeasurementOriginalRoot) {
+
+                $oldRoot =
+                [string]$script:MeasurementOriginalRoot
+            }
+
+
+            if (Has-Value $script:MeasurementOriginalShoot) {
+
+                $oldShoot =
+                [string]$script:MeasurementOriginalShoot
+            }
+
+
+            $message = @"
+即将清除已有测定数据。
+
+样本：$sampleId
+阶段：${stage}DAG
+
+当前数据：
+根长：$oldRoot mm
+苗长：$oldShoot mm
+
+清除后，该阶段将恢复为尚未完成状态。
+
+是否确认清除？
+"@
+
+
+            $answer =
+            [Windows.Forms.MessageBox]::Show(
+                $message,
+                '确认清除测定数据',
+                [Windows.Forms.MessageBoxButtons]::YesNo,
+                [Windows.Forms.MessageBoxIcon]::Warning,
+                [Windows.Forms.MessageBoxDefaultButton]::Button2
+            )
+
+
+            if (
+                $answer -ne
+                [Windows.Forms.DialogResult]::Yes
+            ) {
+                return
+            }
+
+
+            Clear-ExistingMeasurement `
+                $sampleId `
+                $stage
+
+
+            $mStatus.ForeColor =
+            $script:UiPalette.Success
+
+            $mStatus.Text =
+            "✓ $sampleId · ${stage}DAG 数据已清除"
+
+
+            Refresh-Ui
+
+
+            Exit-MeasurementEditMode $true
+        }
+        catch {
+
+            Handle-Error `
+                '清除根苗长历史数据失败' `
+                $_
+        }
+    })
+    
+$mConfirmEdit.Add_Click({
+
+        try {
+
+            if (
+                -not
+                $script:MeasurementEditMode
+            ) {
+                return
+            }
+
+
+            $newRoot =
+            Parse-Measure $mRoot.Text
+
+            $newShoot =
+            Parse-Measure $mShoot.Text
+
+
+            $rootUnchanged =
+            Test-MeasurementValueEqual `
+                $script:MeasurementOriginalRoot `
+                $newRoot
+
+            $shootUnchanged =
+            Test-MeasurementValueEqual `
+                $script:MeasurementOriginalShoot `
+                $newShoot
+
+
+            if (
+                $rootUnchanged -and
+                $shootUnchanged
+            ) {
+
+                $mStatus.ForeColor =
+                $script:UiPalette.TextSecondary
+
+                $mStatus.Text =
+                '数据没有变化，未执行修改'
+
+                Exit-MeasurementEditMode $true
+
+                return
+            }
+
+
+            $sampleId =
+            $script:MeasurementEditSampleId
+
+            $stage =
+            $script:MeasurementEditStage
+
+
+            $oldRoot =
+            '空'
+
+            $oldShoot =
+            '空'
+
+
+            if (Has-Value $script:MeasurementOriginalRoot) {
+
+                $oldRoot =
+                [string]$script:MeasurementOriginalRoot
+            }
+
+
+            if (Has-Value $script:MeasurementOriginalShoot) {
+
+                $oldShoot =
+                [string]$script:MeasurementOriginalShoot
+            }
+
+
+            $rootChangeText =
+            "$oldRoot → $($mRoot.Text) mm"
+
+            $shootChangeText =
+            "$oldShoot → $($mShoot.Text) mm"
+
+
+            if ($rootUnchanged) {
+                $rootChangeText =
+                "$oldRoot mm（未变化）"
+            }
+
+            if ($shootUnchanged) {
+                $shootChangeText =
+                "$oldShoot mm（未变化）"
+            }
+
+
+            $message = @"
+即将修改已有测定数据。
+
+样本：$sampleId
+阶段：${stage}DAG
+
+根长：$rootChangeText
+苗长：$shootChangeText
+
+是否确认修改？
+"@
+
+
+            $answer =
+            [Windows.Forms.MessageBox]::Show(
+                $message,
+                '确认修改历史数据',
+                [Windows.Forms.MessageBoxButtons]::YesNo,
+                [Windows.Forms.MessageBoxIcon]::Warning,
+                [Windows.Forms.MessageBoxDefaultButton]::Button2
+            )
+
+
+            if (
+                $answer -ne
+                [Windows.Forms.DialogResult]::Yes
+            ) {
+                return
+            }
+
+
+            Update-ExistingMeasurement `
+                $sampleId `
+                $stage `
+                $mRoot.Text `
+                $mShoot.Text
+
+
+            $mStatus.ForeColor =
+            $script:UiPalette.Success
+
+            $mStatus.Text =
+            "✓ $sampleId · ${stage}DAG 历史数据已修改"
+
+
+            Refresh-Ui
+
+
+            Exit-MeasurementEditMode $true
+        }
+        catch {
+
+            Handle-Error `
+                '修改根苗长历史数据失败' `
+                $_
+        }
+    })
+    
+$mHistoryGrid.Add_CellDoubleClick({
+
+        param(
+            $sender,
+            $e
+        )
+
+
+        if ($e.RowIndex -lt 0) {
+            return
+        }
+
+        if ($e.ColumnIndex -lt 0) {
+            return
+        }
+
+
+        $column =
+        $mHistoryGrid.Columns[
+        $e.ColumnIndex
+        ]
+
+
+        $stage = 0
+
+
+        switch ($column.Name) {
+
+            'mHistRoot3' {
+                $stage = 3
+            }
+
+            'mHistShoot3' {
+                $stage = 3
+            }
+
+            'mHistRoot7' {
+                $stage = 7
+            }
+
+            'mHistShoot7' {
+                $stage = 7
+            }
+
+            'mHistRoot14' {
+                $stage = 14
+            }
+
+            'mHistShoot14' {
+                $stage = 14
+            }
+
+            default {
+                return
+            }
+        }
+
+
+        $row =
+        $mHistoryGrid.Rows[
+        $e.RowIndex
+        ]
+
+
+        $sampleId =
+        Safe-Text $row.Tag
+
+
+        if (
+            [string]::IsNullOrWhiteSpace(
+                $sampleId
+            )
+        ) {
+            return
+        }
+
+
+        Enter-MeasurementEditMode `
+            $sampleId `
+            $stage
+    })
+    
+$mCancelEdit.Add_Click({
+
+        Exit-MeasurementEditMode $true
+    })
+    
+$mStage.Add_SelectedIndexChanged({
+
+        if ($null -ne $mHistoryGrid) {
+
+            Apply-MeasurementHistoryHighlight
+        }
+    })
+
 $mFind.Add_Click({
         Lookup-M
     })
@@ -5663,7 +8212,20 @@ $mShoot.Add_KeyDown({
         param($sender, $e)
 
         if ($e.KeyCode -eq [Windows.Forms.Keys]::Enter) {
+
             $e.SuppressKeyPress = $true
+            $e.Handled = $true
+
+            # 历史修改模式：
+            # Enter 等价于点击“确认修改”。
+            if ($script:MeasurementEditMode) {
+
+                $mConfirmEdit.PerformClick()
+                return
+            }
+
+            # 正常测定模式：
+            # 保持原有“保存并下一条”行为。
             Save-CurrentMeasurement $true
         }
     })
@@ -5676,6 +8238,25 @@ $mSaveNext.Add_Click({
         Save-CurrentMeasurement $true
     })
 
+# 历史修改模式下按 Esc：
+# 取消修改并恢复原来的正常测定任务。
+$form.Add_KeyDown({
+
+        param($sender, $e)
+
+        if (
+            $script:MeasurementEditMode -and
+            $e.KeyCode -eq
+            [Windows.Forms.Keys]::Escape
+        ) {
+
+            $e.SuppressKeyPress = $true
+            $e.Handled = $true
+
+            Exit-MeasurementEditMode $true
+        }
+    })
+    
 # -------------------------------------------------------------------------
 # 15.5 软件关闭：只绑定一次，确保后台 Excel 被彻底退出
 # -------------------------------------------------------------------------
@@ -5704,7 +8285,7 @@ $form.Add_Shown({
     
         # BeginInvoke 让窗口先出现，减少“启动后长时间没有反应”的感觉。
         $form.BeginInvoke([Action] {
-                # 窗口完成布局后，再设置发芽巡检左右区域宽度
+                # 发芽巡检窗口布局
                 if ($null -ne $gSplit) {
 
                     if ($gSplit.Width -gt 900) {
@@ -5714,6 +8295,19 @@ $form.Add_Shown({
                         $gSplit.SplitterDistance = [int]($gSplit.Width * 0.45)
                     }
                 }
+
+                # 根苗长
+                if ($null -ne $mSplit) {
+
+                    if ($mSplit.Width -gt 1050) {
+                        $mSplit.SplitterDistance = 440
+                    }
+                    elseif ($mSplit.Width -gt 800) {
+                        $mSplit.SplitterDistance =
+                        [int]($mSplit.Width * 0.40)
+                    }
+                }
+        
                 try {
                     $conn.ForeColor = $script:UiPalette.TextSecondary
                     $conn.Text = 'Excel：正在连接……'
