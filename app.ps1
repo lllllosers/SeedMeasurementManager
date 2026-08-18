@@ -2133,12 +2133,9 @@ function Save-GerminationInspection(
     )
 
 
-    # 本次实际需要记录坐标的数量：
-    #
-    # 新增3粒、还缺10个样本 -> 需要3个坐标
-    # 新增8粒、还缺3个样本  -> 需要3个坐标
-    # 已经10/10              -> 需要0个坐标
-    $requiredCoordinateCount =
+    # 本次需要推进的测定样本数量。
+    # 坐标现在是可选信息，不再决定是否能够分配测定样本。
+    $samplesToAssignCount =
     [Math]::Min(
         [int]$NewGerminated,
         [int]$blankSlots.Count
@@ -2179,19 +2176,17 @@ function Save-GerminationInspection(
     }
 
 
+    # 坐标允许完全不填写，也允许只填写部分。
+    # 但不能比本次实际分配的测定样本更多。
     if (
-        $coordList.Count -ne
-        $requiredCoordinateCount
+        $coordList.Count -gt
+        $samplesToAssignCount
     ) {
 
         throw (
-            '本次新增发芽 ' +
-            $NewGerminated +
-            ' 粒；当前还缺 ' +
-            $blankSlots.Count +
-            ' 个测定样本，因此需要填写 ' +
-            $requiredCoordinateCount +
-            ' 个坐标。当前填写了 ' +
+            '本次最多只能填写 ' +
+            $samplesToAssignCount +
+            ' 个坐标，当前填写了 ' +
             $coordList.Count +
             ' 个。'
         )
@@ -2362,7 +2357,7 @@ function Save-GerminationInspection(
 
     for (
         $i = 0;
-        $i -lt $requiredCoordinateCount;
+        $i -lt $samplesToAssignCount;
         $i++
     ) {
 
@@ -2374,8 +2369,15 @@ function Save-GerminationInspection(
         [string]$slot.SampleId
 
 
-        $coord =
-        [string]$coordList[$i]
+        # 坐标现在是可选项。
+        # 如果用户没有填写，则保留为空。
+        $coord = ''
+
+        if ($i -lt $coordList.Count) {
+
+            $coord =
+            [string]$coordList[$i]
+        }
 
 
         # 根-苗长统计表 F列：发芽日期
@@ -2432,11 +2434,20 @@ function Save-GerminationInspection(
         ].Row
 
 
-        Set-CellValue `
-            $script:PlanSheet `
-            $planRow `
-            14 `
-            $coord
+        # 只有实际填写了坐标时才写入 N 列。
+        if (
+            -not
+            [string]::IsNullOrWhiteSpace(
+                $coord
+            )
+        ) {
+
+            Set-CellValue `
+                $script:PlanSheet `
+                $planRow `
+                14 `
+                $coord
+        }
 
 
         [void]$assignments.Add(
@@ -3321,7 +3332,7 @@ $gSplit.Panel1.Controls.Add($gSpeciesGrid)
 
 [void]$gSpeciesGrid.Columns.Add(
     'gMissingCoord',
-    '未记坐标'
+    '未填坐标'
 )
 
 
@@ -3443,7 +3454,7 @@ $gPlacedDate.Value =
 
 $gPlacedDate.Location =
 New-Object Drawing.Point(
-    140,
+    155,
     84
 )
 
@@ -3511,7 +3522,7 @@ New-Object Windows.Forms.TextBox
 
 $gNewCount.Location =
 New-Object Drawing.Point(
-    140,
+    155,
     125
 )
 
@@ -3561,12 +3572,12 @@ $gNewCoordLabel =
 New-Object Windows.Forms.Label
 
 $gNewCoordLabel.Text =
-'样本坐标'
+'样本坐标（可选）'
 
 $gNewCoordLabel.Location =
 New-Object Drawing.Point(
     20,
-    132
+    173
 )
 
 $gNewCoordLabel.AutoSize =
@@ -3582,7 +3593,7 @@ New-Object Windows.Forms.TextBox
 
 $gNewCoords.Location =
 New-Object Drawing.Point(
-    140,
+    155,
     166
 )
 
@@ -3607,7 +3618,7 @@ $gNewCoordHint =
 New-Object Windows.Forms.Label
 
 $gNewCoordHint.Text =
-'先输入本次新增粒数'
+'可不填写'
 
 $gNewCoordHint.Location =
 New-Object Drawing.Point(
@@ -3636,7 +3647,7 @@ $gBatchDate = New-Object Windows.Forms.DateTimePicker
 $gBatchDate.Format = 'Custom'
 $gBatchDate.CustomFormat = 'yyyy/M/d'
 $gBatchDate.Value = (Get-Date).Date
-$gBatchDate.Location = New-Object Drawing.Point(140, 207)
+$gBatchDate.Location = New-Object Drawing.Point(155, 207)
 $gBatchDate.Size = New-Object Drawing.Size(150, 30)
 $gBatchDate.Font = $script:UiFont.Input
 $gDetailTop.Controls.Add($gBatchDate)
@@ -4289,7 +4300,7 @@ function Refresh-GerminationStats {
     "培养皿 $dishCount   |   " +
     "累计发芽 $germinatedSeeds/$totalSeeds   |   " +
     "今日新增 $todayNew   |   " +
-    "未记坐标 $missingCoordCount"
+    "未填坐标 $missingCoordCount"
 }
 
 
@@ -4470,7 +4481,7 @@ function Refresh-GerminationUi {
     if ($null -eq $script:Book) {
 
         $gStats.Text =
-        '培养皿 0   |   累计发芽 0/0   |   今日新增 0   |   未记坐标 0'
+        '培养皿 0   |   累计发芽 0/0   |   今日新增 0   |   未填坐标 0'
 
         $gSpeciesGrid.Rows.Clear()
 
@@ -4597,7 +4608,7 @@ function Update-GerminationCoordinateHint {
         $true
 
         $gNewCoordHint.Text =
-        "本次需要填写 $required 个坐标"
+        "坐标可选；本次最多填写 $required 个"
     }
 }
 
@@ -4687,7 +4698,7 @@ function Load-GerminationSpeciesDetail(
     "发芽 $germinated/$totalSeeds（$rateText）   |   " +
     "测定样本 $($item.GerminatedCount)/$($item.TotalCount)   |   " +
     "还需样本 $($item.RemainingCount)   |   " +
-    "未记坐标 $($item.MissingCoordCount)"
+    "未填坐标 $($item.MissingCoordCount)"
 
     $replicate =
     [string]$script:ExperimentSettings.DefaultReplicate
