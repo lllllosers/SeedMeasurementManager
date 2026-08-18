@@ -329,6 +329,13 @@ $script:IgnoreTaskFilterEvents = $false
 
 $script:MeasurementEditMode = $false
 
+# 当前是否是“按物种查询历史、但该物种没有今日任务”的查看状态
+$script:MeasurementQueryHistoryOnly = $false
+
+# 如果从纯历史查看状态进入纠错，
+# 修改结束后回到原物种历史，而不是跳到其他今日任务。
+$script:MeasurementReturnHistorySpeciesId = ''
+
 # 正在修改的历史样本和 DAG
 $script:MeasurementEditSampleId = ''
 $script:MeasurementEditStage = 0
@@ -2831,6 +2838,92 @@ function Has-Value($Value) {
     return $true
 }
 
+function Test-MeasurementValueEqual(
+    $Value1,
+    $Value2
+) {
+    $has1 = Has-Value $Value1
+    $has2 = Has-Value $Value2
+
+
+    if (-not $has1 -and -not $has2) {
+        return $true
+    }
+
+    if ($has1 -ne $has2) {
+        return $false
+    }
+
+
+    $text1 =
+    (Safe-Text $Value1).ToUpperInvariant()
+
+    $text2 =
+    (Safe-Text $Value2).ToUpperInvariant()
+
+
+    # NA 属于特殊有效值。
+    if (
+        $text1 -eq 'NA' -or
+        $text2 -eq 'NA'
+    ) {
+        return ($text1 -eq $text2)
+    }
+
+
+    $number1 = 0.0
+    $number2 = 0.0
+
+
+    $ok1 =
+    [double]::TryParse(
+        $text1,
+        [Globalization.NumberStyles]::Float,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [ref]$number1
+    )
+
+    if (-not $ok1) {
+
+        $ok1 =
+        [double]::TryParse(
+            $text1,
+            [ref]$number1
+        )
+    }
+
+
+    $ok2 =
+    [double]::TryParse(
+        $text2,
+        [Globalization.NumberStyles]::Float,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [ref]$number2
+    )
+
+    if (-not $ok2) {
+
+        $ok2 =
+        [double]::TryParse(
+            $text2,
+            [ref]$number2
+        )
+    }
+
+
+    if ($ok1 -and $ok2) {
+
+        return (
+            [Math]::Abs(
+                $number1 - $number2
+            ) -lt 0.0000001
+        )
+    }
+
+
+    return ($text1 -eq $text2)
+}
+
 function Get-ExistingMeasurement(
     [string]$SampleId,
     [int]$Stage
@@ -4166,7 +4259,7 @@ $mSplit.Panel1.Controls.Add($mInputPanel)
 # -----------------------------------------------------------------------------
 
 $mL1 = New-Object Windows.Forms.Label
-$mL1.Text = '样本ID'
+$mL1.Text = '样本/物种'
 $mL1.Location = New-Object Drawing.Point(25, 35)
 $mL1.AutoSize = $true
 $mL1.ForeColor = $script:UiPalette.TextSecondary
@@ -4218,7 +4311,7 @@ $mCard.Controls.Add($mCardSid)
 $mInfo = New-Object Windows.Forms.Label
 $mInfo.Text = '请输入或选择样本'
 $mInfo.Location = New-Object Drawing.Point(20, 60)
-$mInfo.Size = New-Object Drawing.Size(345, 38)
+$mInfo.Size = New-Object Drawing.Size(345, 48)
 $mInfo.Font = $script:UiFont.Body
 $mInfo.ForeColor = $script:UiPalette.TextSecondary
 $mInfo.AutoEllipsis = $true
@@ -4233,7 +4326,8 @@ $mL3 = New-Object Windows.Forms.Label
 $mL3.Text = '测定阶段'
 $mL3.Location = New-Object Drawing.Point(25, 235)
 $mL3.AutoSize = $true
-$mL3.ForeColor = $script:UiPalette.TextSecondary
+$mL3.ForeColor = $script:UiPalette.TextPrimary
+$mL3.Font = $script:UiFont.BodyBold
 $mInputPanel.Controls.Add($mL3)
 
 $mStage = New-Object Windows.Forms.ComboBox
@@ -4266,7 +4360,8 @@ $mL4 = New-Object Windows.Forms.Label
 $mL4.Text = '根长（mm）'
 $mL4.Location = New-Object Drawing.Point(25, 305)
 $mL4.AutoSize = $true
-$mL4.ForeColor = $script:UiPalette.TextSecondary
+$mL4.ForeColor = $script:UiPalette.TextPrimary
+$mL4.Font = $script:UiFont.BodyBold
 $mInputPanel.Controls.Add($mL4)
 
 $mRoot = New-Object Windows.Forms.TextBox
@@ -4287,7 +4382,8 @@ $mL5 = New-Object Windows.Forms.Label
 $mL5.Text = '苗长（mm）'
 $mL5.Location = New-Object Drawing.Point(25, 375)
 $mL5.AutoSize = $true
-$mL5.ForeColor = $script:UiPalette.TextSecondary
+$mL5.ForeColor = $script:UiPalette.TextPrimary
+$mL5.Font = $script:UiFont.BodyBold
 $mInputPanel.Controls.Add($mL5)
 
 $mShoot = New-Object Windows.Forms.TextBox
@@ -4395,21 +4491,150 @@ $mHistoryLayout.Controls.Add(
     0
 )
 
-$mHistoryTitle = New-Object Windows.Forms.Label
-$mHistoryTitle.Text = '当前物种测定历史'
-$mHistoryTitle.Location = New-Object Drawing.Point(16, 10)
-$mHistoryTitle.AutoSize = $true
-$mHistoryTitle.Font = $script:UiFont.BodyBold
-$mHistoryTitle.ForeColor = $script:UiPalette.TextPrimary
-$mHistoryTitlePanel.Controls.Add($mHistoryTitle)
+$mHistoryTitleBar =
+New-Object Windows.Forms.TableLayoutPanel
 
-$mHistoryUnit = New-Object Windows.Forms.Label
-$mHistoryUnit.Text = '单位：mm'
-$mHistoryUnit.Location = New-Object Drawing.Point(430, 12)
-$mHistoryUnit.AutoSize = $true
-$mHistoryUnit.Font = $script:UiFont.Small
-$mHistoryUnit.ForeColor = $script:UiPalette.TextSecondary
-$mHistoryTitlePanel.Controls.Add($mHistoryUnit)
+$mHistoryTitleBar.Dock =
+'Fill'
+
+$mHistoryTitleBar.Margin =
+New-Object Windows.Forms.Padding(0)
+
+$mHistoryTitleBar.Padding =
+New-Object Windows.Forms.Padding(0)
+
+$mHistoryTitleBar.RowCount =
+1
+
+$mHistoryTitleBar.ColumnCount =
+3
+
+$mHistoryTitleBar.BackColor =
+$script:UiPalette.Surface
+
+$mHistoryTitlePanel.Controls.Add(
+    $mHistoryTitleBar
+)
+
+
+# 左右各留相同宽度，
+# 保证中间物种标题真正居中。
+$leftStyle =
+New-Object Windows.Forms.ColumnStyle
+
+$leftStyle.SizeType =
+[Windows.Forms.SizeType]::Absolute
+
+$leftStyle.Width =
+130
+
+[void]$mHistoryTitleBar.ColumnStyles.Add(
+    $leftStyle
+)
+
+
+$centerStyle =
+New-Object Windows.Forms.ColumnStyle
+
+$centerStyle.SizeType =
+[Windows.Forms.SizeType]::Percent
+
+$centerStyle.Width =
+100
+
+[void]$mHistoryTitleBar.ColumnStyles.Add(
+    $centerStyle
+)
+
+
+$rightStyle =
+New-Object Windows.Forms.ColumnStyle
+
+$rightStyle.SizeType =
+[Windows.Forms.SizeType]::Absolute
+
+$rightStyle.Width =
+130
+
+[void]$mHistoryTitleBar.ColumnStyles.Add(
+    $rightStyle
+)
+
+
+# 左侧留空，保持视觉对称。
+$mHistoryTitleSpacer =
+New-Object Windows.Forms.Label
+
+$mHistoryTitleSpacer.Dock =
+'Fill'
+
+$mHistoryTitleBar.Controls.Add(
+    $mHistoryTitleSpacer,
+    0,
+    0
+)
+
+
+$mHistoryTitle =
+New-Object Windows.Forms.Label
+
+$mHistoryTitle.Text =
+'当前物种测定历史'
+
+$mHistoryTitle.Dock =
+'Fill'
+
+$mHistoryTitle.TextAlign =
+[Drawing.ContentAlignment]::MiddleCenter
+
+$mHistoryTitle.Font =
+New-Object Drawing.Font(
+    'Microsoft YaHei UI',
+    13,
+    [Drawing.FontStyle]::Bold
+)
+
+$mHistoryTitle.ForeColor =
+$script:UiPalette.TextPrimary
+
+$mHistoryTitleBar.Controls.Add(
+    $mHistoryTitle,
+    1,
+    0
+)
+
+
+$mHistoryUnit =
+New-Object Windows.Forms.Label
+
+$mHistoryUnit.Text =
+'单位：mm'
+
+$mHistoryUnit.Dock =
+'Fill'
+
+$mHistoryUnit.TextAlign =
+[Drawing.ContentAlignment]::MiddleRight
+
+$mHistoryUnit.Padding =
+New-Object Windows.Forms.Padding(
+    0,
+    0,
+    14,
+    0
+)
+
+$mHistoryUnit.Font =
+$script:UiFont.BodyBold
+
+$mHistoryUnit.ForeColor =
+$script:UiPalette.TextPrimary
+
+$mHistoryTitleBar.Controls.Add(
+    $mHistoryUnit,
+    2,
+    0
+)
 
 
 # -----------------------------------------------------------------------------
@@ -4683,7 +4908,7 @@ Set-UiGrid $mHistoryGrid
 # -----------------------------------------------------------------------------
 
 $mHistoryHint = New-Object Windows.Forms.Label
-$mHistoryHint.Text = '当前版本仅查看历史；下一步将支持双击已有测定值进行纠错'
+$mHistoryHint.Text = '双击已有测定值可修改；空白测定值请通过正常测定流程录入'
 $mHistoryHint.Dock = 'Fill'
 $mHistoryHint.TextAlign =
 [Drawing.ContentAlignment]::MiddleLeft
@@ -6159,10 +6384,123 @@ function Enter-MeasurementEditMode(
     [int]$Stage
 ) {
 
+    # -------------------------------------------------------------------------
+    # 如果已经处于纠错模式：
+    # 允许直接双击另一个历史值切换目标。
+    #
+    # 如果当前输入框已经被修改，则先询问是否放弃未保存修改。
+    # -------------------------------------------------------------------------
+
     if ($script:MeasurementEditMode) {
-        return
+
+        # 双击的就是当前正在修改的同一个 DAG，不需要重新加载。
+        if (
+            $script:MeasurementEditSampleId -eq
+            $SampleId -and
+            $script:MeasurementEditStage -eq
+            $Stage
+        ) {
+            return
+        }
+
+
+        $newRootCurrent =
+        $null
+
+        $newShootCurrent =
+        $null
+
+
+        try {
+
+            $newRootCurrent =
+            Parse-Measure $mRoot.Text
+
+            $newShootCurrent =
+            Parse-Measure $mShoot.Text
+        }
+        catch {
+            # 当前输入甚至还没有形成合法测定值，
+            # 也属于“发生了未保存编辑”。
+            $newRootCurrent =
+            $mRoot.Text
+
+            $newShootCurrent =
+            $mShoot.Text
+        }
+
+
+        $rootUnchanged =
+        Test-MeasurementValueEqual `
+            $script:MeasurementOriginalRoot `
+            $newRootCurrent
+
+        $shootUnchanged =
+        Test-MeasurementValueEqual `
+            $script:MeasurementOriginalShoot `
+            $newShootCurrent
+
+
+        if (
+            -not $rootUnchanged -or
+            -not $shootUnchanged
+        ) {
+
+            $answer =
+            [Windows.Forms.MessageBox]::Show(
+                (
+                    '当前历史修改尚未保存。' +
+                    "`r`n`r`n" +
+                    '是否放弃当前修改并切换到：' +
+                    "`r`n" +
+                    "$SampleId · ${Stage}DAG？"
+                ),
+                '切换历史修改目标',
+                [Windows.Forms.MessageBoxButtons]::YesNo,
+                [Windows.Forms.MessageBoxIcon]::Warning,
+                [Windows.Forms.MessageBoxDefaultButton]::Button2
+            )
+
+
+            if (
+                $answer -ne
+                [Windows.Forms.DialogResult]::Yes
+            ) {
+                return
+            }
+        }
+    }
+    else {
+
+        # ---------------------------------------------------------------------
+        # 第一次进入纠错：
+        # 记住纠错完成后应该回到哪里。
+        # ---------------------------------------------------------------------
+
+        if ($script:MeasurementQueryHistoryOnly) {
+
+            # 当前是某个没有今日任务的物种历史页面。
+            $script:MeasurementReturnSampleId =
+            ''
+
+            $script:MeasurementReturnHistorySpeciesId =
+            Get-SpeciesIdFromSampleId $SampleId
+        }
+        else {
+
+            # 当前是正常实验流程。
+            $script:MeasurementReturnSampleId =
+            Get-MeasurementResumeSampleId
+
+            $script:MeasurementReturnHistorySpeciesId =
+            ''
+        }
     }
 
+
+    # -------------------------------------------------------------------------
+    # 读取即将修改的新目标
+    # -------------------------------------------------------------------------
 
     $existing =
     Get-ExistingMeasurement `
@@ -6175,19 +6513,14 @@ function Enter-MeasurementEditMode(
         -not (Has-Value $existing.Shoot)
     ) {
 
-        # 空格不进入纠错模式。
+        # 空白测定值不能通过历史表补录。
         return
     }
 
 
-    # 记住纠错完成后真正应该继续执行的今日任务。
-    # 不能简单记录当前 mSid：
-    # 当前样本如果刚刚完成某一 DAG，
-    # Lookup-M 可能已经显示该样本自己的下一阶段，
-    # 但实验队列真正的下一项可能是另一个样本。
-    $script:MeasurementReturnSampleId =
-    Get-MeasurementResumeSampleId
-
+    # -------------------------------------------------------------------------
+    # 正式切换当前纠错目标
+    # -------------------------------------------------------------------------
 
     $script:MeasurementEditMode =
     $true
@@ -6204,10 +6537,6 @@ function Enter-MeasurementEditMode(
     $script:MeasurementOriginalShoot =
     $existing.Shoot
 
-
-    # -------------------------------------------------------------
-    # 将历史记录载入正常输入框。
-    # -------------------------------------------------------------
 
     $mSid.Text =
     $SampleId
@@ -6246,15 +6575,24 @@ function Enter-MeasurementEditMode(
     $SampleId
 
     $mInfo.Text =
-    "$($info.SpeciesId) · " +
-    "$($info.SpeciesName) · " +
-    "种子 $($info.SeedNo) · 历史修改"
+    "$($info.SpeciesId) · $($info.SpeciesName) · " +
+    "种子 $($info.SeedNo)" +
+    "`r`n" +
+    "当前状态：历史修改"
 
 
-    # -------------------------------------------------------------
-    # 锁定定位信息。
-    # -------------------------------------------------------------
+    # 当前样本卡进入纠错视觉状态。
+    $mCard.BackColor =
+    $script:UiPalette.WarningSoft
 
+    $mCardSid.ForeColor =
+    $script:UiPalette.Warning
+
+    $mInfo.ForeColor =
+    $script:UiPalette.Warning
+
+
+    # 定位信息锁定。
     $mSid.Enabled =
     $false
 
@@ -6265,7 +6603,15 @@ function Enter-MeasurementEditMode(
     $false
 
 
-    # 正常保存按钮隐藏/禁用。
+    # 根苗输入必须允许编辑。
+    $mRoot.Enabled =
+    $true
+
+    $mShoot.Enabled =
+    $true
+
+
+    # 正常保存按钮禁用。
     $mSave.Enabled =
     $false
 
@@ -6278,6 +6624,13 @@ function Enter-MeasurementEditMode(
 
     $mEditBanner.Visible =
     $true
+
+
+    $mStatus.ForeColor =
+    $script:UiPalette.Warning
+
+    $mStatus.Text =
+    "历史修改模式 · $SampleId · ${Stage}DAG"
 
 
     Refresh-MeasurementHistory `
@@ -6295,6 +6648,8 @@ function Exit-MeasurementEditMode(
     $returnSampleId =
     $script:MeasurementReturnSampleId
 
+    $returnHistorySpeciesId =
+    $script:MeasurementReturnHistorySpeciesId
 
     $script:MeasurementEditMode =
     $false
@@ -6313,7 +6668,8 @@ function Exit-MeasurementEditMode(
 
     $script:MeasurementReturnSampleId =
     ''
-
+    $script:MeasurementReturnHistorySpeciesId =
+    ''
 
     $mSid.Enabled =
     $true
@@ -6332,6 +6688,19 @@ function Exit-MeasurementEditMode(
 
     $mEditBanner.Visible =
     $false
+
+    # 恢复正常录入视觉状态。
+    $mCard.BackColor =
+    $script:UiPalette.Surface
+
+    $mCardSid.ForeColor =
+    $script:UiPalette.TextPrimary
+
+    $mL1.ForeColor =
+    $script:UiPalette.TextPrimary
+
+    $mL1.Font =
+    $script:UiFont.BodyBold
 
 
     $mRoot.Clear()
@@ -6410,6 +6779,37 @@ function Exit-MeasurementEditMode(
         }
     }
 
+    # -------------------------------------------------------------------------
+    # 如果纠错前是纯历史查看，
+    # 修改结束后重新回到该物种历史。
+    # -------------------------------------------------------------------------
+
+    if (
+        $RestoreNormalTask -and
+        -not
+        [string]::IsNullOrWhiteSpace(
+            $returnHistorySpeciesId
+        )
+    ) {
+
+        $mSid.Enabled =
+        $true
+
+        $mFind.Enabled =
+        $true
+
+        $mStage.Enabled =
+        $true
+
+
+        $mSid.Text =
+        $returnHistorySpeciesId
+
+
+        Lookup-M
+
+        return
+    }
 
     $mSid.Clear()
 
@@ -6500,6 +6900,38 @@ function Apply-MeasurementHistoryHighlight {
             $currentStage
     )
 
+    # -------------------------------------------------------------------------
+    # DAG 一级表头恢复默认状态
+    # -------------------------------------------------------------------------
+
+    $mDag3Label.BackColor =
+    $script:UiPalette.GridHeader
+
+    $mDag7Label.BackColor =
+    $script:UiPalette.GridHeader
+
+    $mDag14Label.BackColor =
+    $script:UiPalette.GridHeader
+
+
+    # 当前 DAG 的一级表头同步强调。
+    switch ($currentStage) {
+
+        3 {
+            $mDag3Label.BackColor =
+            $script:UiPalette.WarningSoft
+        }
+
+        7 {
+            $mDag7Label.BackColor =
+            $script:UiPalette.WarningSoft
+        }
+
+        14 {
+            $mDag14Label.BackColor =
+            $script:UiPalette.WarningSoft
+        }
+    }
 
     # -------------------------------------------------------------------------
     # 1. 清除上一轮人为高亮。
@@ -6563,13 +6995,18 @@ function Apply-MeasurementHistoryHighlight {
         $script:UiPalette.TextPrimary
 
 
-        # 当前样本 × 当前 DAG 的交叉位置再强调一次。
+        # 当前样本 × 当前 DAG：
+        # 单独使用第三种浅色作为“输入焦点”。
+        #
+        # 行 = 当前种子
+        # 列 = 当前 DAG
+        # 交叉 = 当前真正正在录入的位置
         foreach ($columnName in $stageColumns) {
 
             $row.Cells[
             $columnName
             ].Style.BackColor =
-            $script:UiPalette.BlueSoft
+            $script:UiPalette.WarningSoft
 
             $row.Cells[
             $columnName
@@ -6684,21 +7121,321 @@ function Refresh-MeasurementHistory(
     Apply-MeasurementHistoryHighlight
 }
 
+function Resolve-MeasurementQuery(
+    [string]$Query
+) {
+    if ($null -eq $script:Book) {
+        throw '尚未连接 Excel。'
+    }
+
+    $text = Safe-Text $Query
+
+    # 每次新查询先恢复为正常查询状态。
+    $script:MeasurementQueryHistoryOnly =
+    $false
+        
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw '请输入样本ID、物种编号或物种名称。'
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 1. 样本ID精确匹配优先
+    # -------------------------------------------------------------------------
+
+    if ($script:DataCache.ContainsKey($text)) {
+        return $text
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 2. 建立物种唯一列表
+    # -------------------------------------------------------------------------
+
+    $speciesMap = @{}
+
+    foreach ($data in $script:DataCache.Values) {
+
+        $speciesId =
+        Safe-Text $data.SpeciesId
+
+        if (
+            [string]::IsNullOrWhiteSpace(
+                $speciesId
+            )
+        ) {
+            continue
+        }
+
+        if (
+            -not
+            $speciesMap.ContainsKey(
+                $speciesId
+            )
+        ) {
+
+            $speciesMap[$speciesId] =
+            [pscustomobject]@{
+                SpeciesId   =
+                $speciesId
+
+                SpeciesName =
+                Safe-Text $data.SpeciesName
+            }
+        }
+    }
+
+
+    $targetSpecies = $null
+
+
+    # -------------------------------------------------------------------------
+    # 3. 物种编号精确匹配
+    # -------------------------------------------------------------------------
+
+    $normalized =
+    Normalize-SpeciesId $text
+
+    if (
+        $speciesMap.ContainsKey(
+            $normalized
+        )
+    ) {
+
+        $targetSpecies =
+        $speciesMap[$normalized]
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 4. 物种名称精确匹配
+    # -------------------------------------------------------------------------
+
+    if ($null -eq $targetSpecies) {
+
+        $queryLower =
+        $text.ToLowerInvariant()
+
+        $exactNameMatches =
+        @(
+            $speciesMap.Values |
+            Where-Object {
+                (
+                    Safe-Text $_.SpeciesName
+                ).ToLowerInvariant() -eq
+                $queryLower
+            }
+        )
+
+
+        if ($exactNameMatches.Count -eq 1) {
+
+            $targetSpecies =
+            $exactNameMatches[0]
+        }
+        elseif ($exactNameMatches.Count -gt 1) {
+
+            throw (
+                '该物种名称对应多个物种编号，' +
+                '请改用物种编号查询。'
+            )
+        }
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 5. 物种名称部分匹配
+    # -------------------------------------------------------------------------
+
+    if ($null -eq $targetSpecies) {
+
+        $queryLower =
+        $text.ToLowerInvariant()
+
+        $partialMatches =
+        @(
+            $speciesMap.Values |
+            Where-Object {
+
+                $name =
+                (
+                    Safe-Text $_.SpeciesName
+                ).ToLowerInvariant()
+
+                -not
+                [string]::IsNullOrWhiteSpace(
+                    $name
+                ) -and
+                $name.Contains(
+                    $queryLower
+                )
+            }
+        )
+
+
+        if ($partialMatches.Count -eq 1) {
+
+            $targetSpecies =
+            $partialMatches[0]
+        }
+        elseif ($partialMatches.Count -gt 1) {
+
+            throw (
+                '查询内容匹配多个物种，' +
+                '请输入更完整的物种名称或物种编号。'
+            )
+        }
+    }
+
+
+    if ($null -eq $targetSpecies) {
+
+        throw (
+            '未找到与“' +
+            $text +
+            '”匹配的样本或物种。'
+        )
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 6. 输入物种时，定位到该物种今天最前面的待测任务
+    # -------------------------------------------------------------------------
+
+    foreach (
+        $task in
+        @($script:TodayTaskCache)
+    ) {
+
+        if (
+            $task.SpeciesId -eq
+            $targetSpecies.SpeciesId
+        ) {
+
+            return [string]$task.SampleId
+        }
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 当前物种没有今日任务：
+    # 查询仍然有效，只进入“历史查看”状态。
+    #
+    # 取该物种第一个样本作为内部定位锚点，
+    # 但界面不会把它冒充成当前待测任务。
+    # -------------------------------------------------------------------------
+
+    $history =
+    @(
+        Get-SpeciesMeasurementHistory `
+            $targetSpecies.SpeciesId
+    )
+
+
+    if ($history.Count -eq 0) {
+
+        throw (
+            '未找到物种 ' +
+            $targetSpecies.SpeciesId +
+            ' 的测定样本。'
+        )
+    }
+
+
+    $script:MeasurementQueryHistoryOnly =
+    $true
+
+
+    return [string]$history[0].SampleId
+}
+
 function Lookup-M {
     try {
-        $sid = $mSid.Text.Trim()
 
-        if ([string]::IsNullOrWhiteSpace($sid)) {
+        $query =
+        $mSid.Text.Trim()
+
+        if (
+            [string]::IsNullOrWhiteSpace(
+                $query
+            )
+        ) {
             return
         }
 
-        $info = Get-SampleInfo $sid
+
+        $sid =
+        Resolve-MeasurementQuery `
+            $query
+
+
+        # 按物种进行纯历史查询时，
+        # 查询框继续显示物种编号；
+        # 正常任务查询则显示实际样本ID。
+        if ($script:MeasurementQueryHistoryOnly) {
+
+            $mSid.Text =
+            (
+                Get-SampleInfo $sid
+            ).SpeciesId
+        }
+        else {
+
+            $mSid.Text =
+            $sid
+        }
+
+
+        $info =
+        Get-SampleInfo $sid
+
+        # ---------------------------------------------------------------------
+        # 仅查看历史：
+        # 当前物种没有今日待测任务，但仍允许浏览和纠错历史。
+        # ---------------------------------------------------------------------
+
+        if ($script:MeasurementQueryHistoryOnly) {
+
+            $mCardSid.Text =
+            $info.SpeciesId
+
+            $mInfo.Text =
+            "$($info.SpeciesId) · $($info.SpeciesName)" +
+            "`r`n" +
+            '当前状态：仅查看历史（今日无待测任务）'
+
+
+            $mStage.SelectedIndex =
+            -1
+
+            $mRoot.Clear()
+            $mShoot.Clear()
+
+
+            Refresh-MeasurementHistory `
+                $sid
+
+
+            $mStatus.ForeColor =
+            $script:UiPalette.TextSecondary
+
+            $mStatus.Text =
+            '当前为历史查看模式；双击右侧已有测定值可修改'
+
+
+            # 不把焦点放到测定输入框。
+            $mHistoryGrid.Focus()
+
+            return
+        }
 
         $mCardSid.Text = $sid
 
         $mInfo.Text =
         "$($info.SpeciesId) · $($info.SpeciesName) · " +
-        "种子 $($info.SeedNo) · 当前状态：$($info.Status)"
+        "种子 $($info.SeedNo)" +
+        "`r`n" +
+        "当前状态：$($info.Status)"
 
         # 每次查询先清空上一样本阶段，避免阶段“串样本”
         $mStage.SelectedIndex = -1
@@ -7207,14 +7944,39 @@ $mConfirmEdit.Add_Click({
             }
 
 
-            # 先校验新值。
-            [void](
-                Parse-Measure $mRoot.Text
-            )
+            $newRoot =
+            Parse-Measure $mRoot.Text
 
-            [void](
-                Parse-Measure $mShoot.Text
-            )
+            $newShoot =
+            Parse-Measure $mShoot.Text
+
+
+            $rootUnchanged =
+            Test-MeasurementValueEqual `
+                $script:MeasurementOriginalRoot `
+                $newRoot
+
+            $shootUnchanged =
+            Test-MeasurementValueEqual `
+                $script:MeasurementOriginalShoot `
+                $newShoot
+
+
+            if (
+                $rootUnchanged -and
+                $shootUnchanged
+            ) {
+
+                $mStatus.ForeColor =
+                $script:UiPalette.TextSecondary
+
+                $mStatus.Text =
+                '数据没有变化，未执行修改'
+
+                Exit-MeasurementEditMode $true
+
+                return
+            }
 
 
             $sampleId =
@@ -7245,19 +8007,32 @@ $mConfirmEdit.Add_Click({
             }
 
 
+            $rootChangeText =
+            "$oldRoot → $($mRoot.Text) mm"
+
+            $shootChangeText =
+            "$oldShoot → $($mShoot.Text) mm"
+
+
+            if ($rootUnchanged) {
+                $rootChangeText =
+                "$oldRoot mm（未变化）"
+            }
+
+            if ($shootUnchanged) {
+                $shootChangeText =
+                "$oldShoot mm（未变化）"
+            }
+
+
             $message = @"
 即将修改已有测定数据。
 
 样本：$sampleId
 阶段：${stage}DAG
 
-原数据：
-根长：$oldRoot mm
-苗长：$oldShoot mm
-
-修改后：
-根长：$($mRoot.Text) mm
-苗长：$($mShoot.Text) mm
+根长：$rootChangeText
+苗长：$shootChangeText
 
 是否确认修改？
 "@
@@ -7458,6 +8233,25 @@ $mSaveNext.Add_Click({
         Save-CurrentMeasurement $true
     })
 
+# 历史修改模式下按 Esc：
+# 取消修改并恢复原来的正常测定任务。
+$form.Add_KeyDown({
+
+        param($sender, $e)
+
+        if (
+            $script:MeasurementEditMode -and
+            $e.KeyCode -eq
+            [Windows.Forms.Keys]::Escape
+        ) {
+
+            $e.SuppressKeyPress = $true
+            $e.Handled = $true
+
+            Exit-MeasurementEditMode $true
+        }
+    })
+    
 # -------------------------------------------------------------------------
 # 15.5 软件关闭：只绑定一次，确保后台 Excel 被彻底退出
 # -------------------------------------------------------------------------
