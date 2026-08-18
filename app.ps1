@@ -1061,7 +1061,15 @@ function Rebuild-Cache {
     $todayTasks = New-Object System.Collections.ArrayList
 
     # -------------------------------------------------------------------------
-    # 5.1 根-苗长统计表：A:F
+    # 5.1 根-苗长统计表：A:L
+    #
+    # A-F：样本基础信息
+    # G-I：3/7/14 DAG 根长
+    # J-L：3/7/14 DAG 苗长
+    #
+    # 根苗长历史统一进入 DataCache。
+    # 后续历史表展示、已有数据检查和纠错均优先读取内存，
+    # 避免切换样本时频繁通过 Excel COM 逐单元格读取。
     # -------------------------------------------------------------------------
 
     $lastCell = $null
@@ -1082,7 +1090,7 @@ function Rebuild-Cache {
         $range = $null
 
         try {
-            $range = $script:DataSheet.Range("A2:F$dataLastRow")
+            $range = $script:DataSheet.Range("A2:L$dataLastRow")
             $values = $range.Value2
         }
         finally {
@@ -1108,6 +1116,16 @@ function Rebuild-Cache {
                 SeedNo      = Safe-Text ($values.GetValue($i, 3))
                 PlacedDate  = $values.GetValue($i, 5)
                 Germination = $values.GetValue($i, 6)
+
+                # 根长
+                Root3       = $values.GetValue($i, 7)
+                Root7       = $values.GetValue($i, 8)
+                Root14      = $values.GetValue($i, 9)
+
+                # 苗长
+                Shoot3      = $values.GetValue($i, 10)
+                Shoot7      = $values.GetValue($i, 11)
+                Shoot14     = $values.GetValue($i, 12)
             }
         }
     }
@@ -2715,31 +2733,46 @@ function Has-Value($Value) {
     return $true
 }
 
-function Get-ExistingMeasurement([string]$SampleId, [int]$Stage) {
-    $info = Get-SampleInfo $SampleId
-    $row = $info.DataRow
+function Get-ExistingMeasurement(
+    [string]$SampleId,
+    [int]$Stage
+) {
+    if ($null -eq $script:Book) {
+        throw '尚未连接 Excel。'
+    }
+
+    $target = $SampleId.Trim()
+
+    if (-not $script:DataCache.ContainsKey($target)) {
+        throw "未找到样本ID：$target"
+    }
+
+    $data = $script:DataCache[$target]
 
     switch ($Stage) {
         3 {
-            $rootCol = 7
-            $shootCol = 10
+            $root = $data.Root3
+            $shoot = $data.Shoot3
         }
+
         7 {
-            $rootCol = 8
-            $shootCol = 11
+            $root = $data.Root7
+            $shoot = $data.Shoot7
         }
+
         14 {
-            $rootCol = 9
-            $shootCol = 12
+            $root = $data.Root14
+            $shoot = $data.Shoot14
         }
+
         default {
             throw "不支持的测定阶段：$Stage"
         }
     }
 
     return [pscustomobject]@{
-        Root  = Get-CellValue $script:DataSheet $row $rootCol
-        Shoot = Get-CellValue $script:DataSheet $row $shootCol
+        Root  = $root
+        Shoot = $shoot
     }
 }
 
