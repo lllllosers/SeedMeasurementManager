@@ -1,6 +1,6 @@
 草种测定管理 / Seed Measurement Manager
-Version: 0.6.1
-Release date: 2026-08-14
+Version: 0.8.0
+Release date: 2026-08-18
 Developer: Steven CC
 Email: cy739717939@gmail.com
 License: MIT
